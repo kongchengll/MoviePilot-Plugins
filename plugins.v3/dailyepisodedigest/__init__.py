@@ -38,7 +38,7 @@ from .config import (
     split_words,
 )
 from .digest import Digest, build_digest, render
-from .fonts import FontBook, resolve_font
+from .fonts import FontBook, locate_font, resolve_font
 
 # 卡片文件名格式，同时用于校验接口入参，杜绝路径穿越
 _CARD_NAME_PATTERN = re.compile(r"^digest_\d{8}_\d{6}\.jpg$")
@@ -48,8 +48,11 @@ _ONCE_JOB_ID = "digest_once"
 _API_PREFIX = "/api/v1/plugin"
 # 远程命令的动作标识，同时用于命令声明与事件判定
 _ACTION_PUSH = "digest_push"
+_ACTION_STATUS = "digest_status"
 # 手动触发的冷却时间，避免连续发命令刷屏
 _MANUAL_COOLDOWN_SECONDS = 60
+# 本插件通知使用的场景类型，渠道必须在场景开关里勾选该值才能收到
+_MESSAGE_TYPE = MessageType.Plugin
 
 
 class DailyEpisodeDigest(_PluginBase):
@@ -60,7 +63,7 @@ class DailyEpisodeDigest(_PluginBase):
     plugin_name = "每日入库速报"
     plugin_desc = "定时统计每天新入库的剧集与电影，渲染成带封面的日报长图，通过 MoviePilot 通知渠道推送。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.1.0"
+    plugin_version = "2.2.0"
     plugin_label = "媒体库,通知"
     plugin_author = "kongchengll"
     plugin_config_prefix = "dailyepisodedigest_"
@@ -140,7 +143,7 @@ class DailyEpisodeDigest(_PluginBase):
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
         """
-        注册远程命令，供用户在消息渠道里手动触发一次推送。
+        注册远程命令，供用户在消息渠道里手动触发推送或查看诊断信息。
         """
         return [
             {
@@ -149,7 +152,14 @@ class DailyEpisodeDigest(_PluginBase):
                 "desc": "立即推送每日入库速报",
                 "category": "插件命令",
                 "data": {"action": _ACTION_PUSH},
-            }
+            },
+            {
+                "cmd": "/digest_status",
+                "event": EventType.PluginAction,
+                "desc": "查看每日入库速报诊断信息",
+                "category": "插件命令",
+                "data": {"action": _ACTION_STATUS},
+            },
         ]
 
     @eventmanager.register(EventType.PluginAction)
@@ -161,11 +171,17 @@ class DailyEpisodeDigest(_PluginBase):
         缺省时使用配置中的统计范围。
         """
         event_data = event.event_data if isinstance(event.event_data, dict) else {}
-        if event_data.get("action") != _ACTION_PUSH:
+        action = event_data.get("action")
+        if action not in (_ACTION_PUSH, _ACTION_STATUS):
             return
 
         channel = event_data.get("channel")
         userid = event_data.get("user")
+
+        if action == _ACTION_STATUS:
+            self._ack(channel, userid, self._status_text())
+            return
+
         now = time.monotonic()
         if self._last_manual_at and now - self._last_manual_at < _MANUAL_COOLDOWN_SECONDS:
             remain = int(_MANUAL_COOLDOWN_SECONDS - (now - self._last_manual_at))
@@ -210,6 +226,72 @@ class DailyEpisodeDigest(_PluginBase):
             )
         except Exception as error:  # noqa: BLE001 - 回执失败不影响推送结果
             logger.debug(f"每日入库速报：发送命令回执失败：{error}")
+
+    def _status_text(self) -> str:
+        """
+        汇总运行态、外网地址、字体与通知渠道开关，用于排查收不到消息的原因。
+
+        重点检查通知渠道的场景开关是否勾选了「插件」：宿主在
+        `app/modules/__init__.py::check_message` 里对未命中场景的广播消息直接丢弃，
+        且不写任何日志，因此这一步只能靠自查。
+        """
+        lines: List[str] = ["【每日入库速报 · 诊断】"]
+        lines.append(f"插件：{'已启用' if self._enabled else '未启用'}")
+        cron = self._config.get("cron", "")
+        lines.append(
+            f"推送周期：{cron}" + ("" if self._cron_valid else "（表达式非法，定时推送不会生效）")
+        )
+
+        start, end, label = resolve_window(self._config.get("window", WINDOW_YESTERDAY))
+        lines.append(f"统计窗口：{label}（{start} ~ {end}）")
+        media_types = "、".join(self._config.get("media_types") or []) or "未选择"
+        lines.append(f"统计类型：{media_types}")
+        lines.append(f"无新增也推送：{'是' if self._config.get('notify_empty') else '否'}")
+
+        base = self._public_base()
+        lines.append(f"外网地址：{base or '不可用（只会发纯文本）'}")
+
+        font_path, font_note = locate_font(
+            self.get_data_path(), self._config.get("font_path", "")
+        )
+        lines.append(f"中文字体：{'已就绪' if font_path else f'未就绪（{font_note}）'}")
+
+        lines.append("通知渠道：")
+        lines.extend(self._channel_status())
+
+        last = self.get_data("last_digest") or {}
+        if last:
+            lines.append(
+                f"上次推送：{last.get('time')}（{last.get('shows')} 部 / "
+                f"{last.get('episodes')} 集，{'含图片' if last.get('image') else '纯文本'}）"
+            )
+        else:
+            lines.append("上次推送：无记录")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _channel_status() -> List[str]:
+        """
+        列出已启用的通知渠道，并标注是否允许「插件」场景。
+        """
+        try:
+            from app.sdk.services import NotificationHelper
+
+            configs = NotificationHelper().get_configs() or {}
+        except Exception as error:  # noqa: BLE001 - 宿主版本差异时降级
+            return [f"· 读取通知渠道失败：{error}"]
+
+        if not configs:
+            return ["· 未配置任何通知渠道"]
+
+        lines: List[str] = []
+        for name, conf in configs.items():
+            switchs = list(getattr(conf, "switchs", None) or [])
+            if _MESSAGE_TYPE.value in switchs:
+                lines.append(f"· {name}：正常")
+            else:
+                lines.append(f"· {name}：未勾选「{_MESSAGE_TYPE.value}」，本插件的通知会被丢弃")
+        return lines
 
     def get_api(self) -> List[Dict[str, Any]]:
         """
@@ -411,13 +493,15 @@ class DailyEpisodeDigest(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "日报图片由插件生成后以链接形式交给通知渠道，"
+                                            "text": "【重要】通知渠道的「场景开关」必须勾选「插件」，"
+                                            "否则宿主的 check_message 会把本插件的广播消息直接丢弃且不写日志。"
+                                            "保存后可在消息渠道发送 /digest_status 查看诊断。"
+                                            "日报图片由插件生成后以链接形式交给通知渠道，"
                                             "因此必须配置可公网访问的地址，否则会降级为纯文本推送。"
                                             "MoviePilot 镜像不含中文字体，插件会在首次出图时自动下载并缓存到插件数据目录；"
                                             "离线环境可把任意中文字体放到插件目录 fonts/ 下，或用「中文字体路径」指定。"
                                             "统计口径为 MoviePilot 整理入库记录，手工放入媒体库的文件不计入。"
-                                            "插件启用后可在已绑定的消息渠道发送 /digest_push 手动触发一次推送，"
-                                            "支持 /digest_push today 或 /digest_push 24h 临时切换统计范围。",
+                                            "手动触发：/digest_push，支持 /digest_push today 或 24h 临时切换统计范围。",
                                         },
                                     }
                                 ],
@@ -508,6 +592,10 @@ class DailyEpisodeDigest(_PluginBase):
             exclude_words=split_words(config.get("exclude_words", "")),
             max_items=int(config.get("image_items") or 8),
         )
+        logger.info(
+            f"每日入库速报：{day_label} 窗口内命中 {len(records)} 条整理记录，"
+            f"聚合为 {digest.total_shows} 部 / {digest.total_episodes} 集"
+        )
         summary: Dict[str, Any] = {
             "label": day_label,
             "shows": digest.total_shows,
@@ -592,7 +680,10 @@ class DailyEpisodeDigest(_PluginBase):
                 image=image,
                 link=link,
             )
-            logger.info(f"每日入库速报：已推送「{title}」{'（含图片）' if image else '（纯文本）'}")
+            logger.info(
+                f"每日入库速报：已提交通知「{title}」{'（含图片）' if image else '（纯文本）'}；"
+                f"渠道若未在场景开关里勾选「{_MESSAGE_TYPE.value}」，消息会被宿主静默丢弃"
+            )
         except Exception as error:  # noqa: BLE001 - 通知失败不应中断插件
             logger.error(f"每日入库速报：发送通知失败：{error}")
 

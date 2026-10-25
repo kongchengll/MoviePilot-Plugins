@@ -3,12 +3,13 @@
     "name": "每日入库速报",
     "description": "定时统计每天新入库的剧集与电影，渲染成带封面的日报长图，通过 MoviePilot 通知渠道推送。",
     "labels": "媒体库,通知",
-    "version": "2.1.0",
+    "version": "2.2.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png",
     "author": "kongchengll",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v2.2.0": "新增 /digest_status 诊断命令；日志补充记录命中条数与渠道场景开关提示。",
       "v2.1.0": "新增 /digest_push 远程命令，可在消息渠道手动触发推送并临时指定统计范围。",
       "v2.0.0": "改为生成日报长图推送：每部作品的封面、标题、季集与入库时间合成一张图。",
       "v1.0.0": "首次发布：文本清单 + 海报墙。"

@@ -53,21 +53,44 @@
 | 无新增也推送 | 关闭时无入库静默跳过 |
 | 保存后立即推送一次 | 用于验证效果，触发后自动复位 |
 
-## 手动触发
+## 手动触发与诊断
 
-插件启用后会注册远程命令，在任意已绑定的消息渠道（Telegram、微信、钉钉等）发送即可：
+插件启用后会注册两个远程命令，在任意已绑定的消息渠道（Telegram、微信、钉钉等）发送即可：
 
 ```text
 /digest_push            按配置的统计范围推一次
 /digest_push today      临时按「今日 00:00 - 当前」推一次
 /digest_push 24h        临时按「最近 24 小时」推一次
+/digest_status          查看诊断信息（渠道开关、外网地址、字体、上次推送）
 ```
 
 触发后会给发起人回一条执行结果（`已推送 3 部 / 6 集（含图片）`），
 连续触发有 60 秒冷却，避免刷屏。命令不影响定时服务，也不会改动配置。
 
-命令的实现路径：`get_command()` 声明 `/digest_push` 并绑定 `EventType.PluginAction`，
-再通过 `@eventmanager.register(EventType.PluginAction)` 按 `action` 判定归属。
+## 收不到消息怎么排查
+
+**最常见的原因：通知渠道的「场景开关」没有勾选「插件」。**
+
+宿主的 `app/modules/__init__.py::check_message` 里有一段过滤：
+
+```python
+if not message.userid and message.mtype:
+    conf = self.get_config(source)
+    if conf:
+        switchs = conf.switchs or []
+        if message.mtype.value not in switchs:
+            return False          # 静默丢弃，日志里不会有任何提示
+```
+
+插件广播的消息没有绑定用户，`mtype` 是「插件」，所以**渠道没勾这个场景就永远收不到，而且日志一片安静**。
+去「设置 → 通知 → 对应渠道 → 场景开关」把「插件」勾上。
+
+排查顺序：
+
+1. 发 `/digest_status`，它会直接告诉你每个渠道是否勾了「插件」。
+2. 看日志里有没有 `每日入库速报：... 命中 N 条整理记录`。没有这行说明定时任务没跑（cron 未生效或插件未启用）。
+3. 有这行但没收到消息 → 就是上面说的场景开关问题。
+4. 收到了纯文本但没有图 → 看诊断里的「外网地址」是否为「不可用」。
 
 ## 图片怎么送到通知渠道
 

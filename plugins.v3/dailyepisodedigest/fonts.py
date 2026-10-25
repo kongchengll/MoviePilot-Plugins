@@ -128,37 +128,52 @@ def _download_font(target: Path) -> Optional[Path]:
     return None
 
 
+def locate_font(data_dir: Path, custom_path: str = "") -> tuple[Optional[Path], str]:
+    """
+    查找已存在的字体文件，不触发下载。
+
+    诊断信息与正式渲染共用同一套优先级，区别只在于这里不会去联网。
+
+    :param data_dir: 插件数据目录
+    :param custom_path: 用户在配置中指定的字体文件路径
+    :return: `(字体路径, 来源描述)`，找不到时路径为 None
+    """
+    if custom_path:
+        custom = Path(custom_path).expanduser()
+        if custom.is_file() and custom.suffix.lower() in _FONT_SUFFIXES:
+            return custom, "配置指定的字体"
+        return None, f"配置的字体不存在：{custom_path}"
+
+    plugin_dir = Path(__file__).resolve().parent
+    bundled = _pick_from_dir(plugin_dir / "fonts")
+    if bundled:
+        return bundled, "插件目录 fonts/"
+
+    cached = data_dir / "fonts" / _FONT_FILENAME
+    if cached.is_file() and cached.stat().st_size >= _MIN_FONT_BYTES:
+        return cached, "数据目录缓存"
+
+    for system_path in _SYSTEM_FONTS:
+        candidate = Path(system_path)
+        if candidate.is_file():
+            return candidate, f"系统字体 {system_path}"
+
+    return None, "未找到，首次出图时会尝试下载"
+
+
 def resolve_font(data_dir: Path, custom_path: str = "") -> Optional[FontBook]:
     """
-    按优先级解析可用字体。
+    按优先级解析可用字体，必要时下载并缓存。
 
     :param data_dir: 插件数据目录，用于存放下载缓存
     :param custom_path: 用户在配置中指定的字体文件路径
     :return: 可用字体；找不到任何中文字体时返回 None
     """
-    if custom_path:
-        custom = Path(custom_path).expanduser()
-        if custom.is_file() and custom.suffix.lower() in _FONT_SUFFIXES:
-            return FontBook(custom)
-        logger.warning(f"每日入库速报：配置的字体文件不存在或格式不支持：{custom_path}")
+    located, _ = locate_font(data_dir, custom_path)
+    if located:
+        return FontBook(located)
 
-    plugin_dir = Path(__file__).resolve().parent
-    bundled = _pick_from_dir(plugin_dir / "fonts")
-    if bundled:
-        return FontBook(bundled)
-
-    cache_dir = data_dir / "fonts"
-    cached = cache_dir / _FONT_FILENAME
-    if cached.is_file() and cached.stat().st_size >= _MIN_FONT_BYTES:
-        return FontBook(cached)
-
-    for system_path in _SYSTEM_FONTS:
-        candidate = Path(system_path)
-        if candidate.is_file():
-            logger.info(f"每日入库速报：使用系统字体 {system_path}")
-            return FontBook(candidate)
-
-    downloaded = _download_font(cached)
+    downloaded = _download_font(data_dir / "fonts" / _FONT_FILENAME)
     if downloaded:
         return FontBook(downloaded)
 
