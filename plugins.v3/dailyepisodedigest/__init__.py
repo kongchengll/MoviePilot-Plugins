@@ -37,7 +37,7 @@ from .config import (
     resolve_window,
     split_words,
 )
-from .digest import Digest, build_digest, render
+from .digest import Digest, EpisodeGroup, build_digest, render
 from .fonts import FontBook, locate_font, resolve_font
 
 # 卡片文件名格式，同时用于校验接口入参，杜绝路径穿越
@@ -63,7 +63,7 @@ class DailyEpisodeDigest(_PluginBase):
     plugin_name = "每日入库速报"
     plugin_desc = "定时统计每天新入库的剧集与电影，渲染成带封面的日报长图，通过 MoviePilot 通知渠道推送。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.3.0"
+    plugin_version = "2.4.0"
     plugin_label = "媒体库,通知"
     plugin_author = "kongchengll"
     plugin_config_prefix = "dailyepisodedigest_"
@@ -298,7 +298,7 @@ class DailyEpisodeDigest(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         """
-        注册日报图片接口，供通知渠道服务端拉取配图。
+        注册日报图片接口与详情页按钮使用的测试接口。
         """
         return [
             {
@@ -318,7 +318,28 @@ class DailyEpisodeDigest(_PluginBase):
                     }
                 },
                 "summary": "获取每日入库日报图片",
-            }
+            },
+            {
+                "path": "/test_text",
+                "endpoint": self.api_test_text,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "发送纯文本测试消息",
+            },
+            {
+                "path": "/test_image",
+                "endpoint": self.api_test_image,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "发送带图测试消息",
+            },
+            {
+                "path": "/push_now",
+                "endpoint": self.api_push_now,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "立即推送真实日报",
+            },
         ]
 
     def serve_card(self, name: str) -> FileResponse:
@@ -354,6 +375,123 @@ class DailyEpisodeDigest(_PluginBase):
                 "kwargs": {},
             }
         ]
+
+    def api_test_text(self) -> Dict[str, Any]:
+        """
+        发送一条纯文本测试消息，用于确认通知渠道本身是否通畅。
+
+        :return: 供页面展示的执行结果
+        """
+        return self._run_test(with_image=False)
+
+    def api_test_image(self) -> Dict[str, Any]:
+        """
+        用样例数据生成一张日报图并发送，用于确认图片链路是否通畅。
+
+        :return: 供页面展示的执行结果
+        """
+        return self._run_test(with_image=True)
+
+    def api_push_now(self) -> Dict[str, Any]:
+        """
+        按当前配置立即推送一次真实日报。
+
+        :return: 供页面展示的执行结果
+        """
+        result = self.push_digest()
+        if result is None:
+            message = "推送失败，请查看 MoviePilot 日志"
+        elif result.get("skipped"):
+            message = f"{result.get('label')} 没有新入库内容，已按配置跳过"
+        elif result.get("empty"):
+            message = f"已推送 {result.get('label')}：没有新入库内容"
+        else:
+            message = (
+                f"已推送 {result.get('label')}：{result.get('shows')} 部 / "
+                f"{result.get('episodes')} 集"
+                f"{'，含图片' if result.get('image') else '，纯文本'}"
+            )
+        self._remember_test("推送真实日报", message)
+        return {"success": result is not None, "message": message}
+
+    def _run_test(self, *, with_image: bool) -> Dict[str, Any]:
+        """
+        构造并发送测试消息。
+
+        :param with_image: 是否使用样例数据生成配图
+        :return: 供页面展示的执行结果
+        """
+        title = "每日入库速报 · 测试"
+        check: Optional[str] = None
+        image: Optional[str] = None
+        if with_image:
+            image, check = self._build_image(self._sample_digest())
+            if not image:
+                message = "图片未能生成：请检查「外网访问地址」与中文字体，详情见日志"
+                self._remember_test("测试图片", message)
+                return {"success": False, "message": message}
+            text = f"这是一条带图测试消息，图片地址自检：{check}。"
+        else:
+            text = (
+                "这是一条纯文本测试消息。收到说明通知渠道通畅；"
+                "没收到请检查渠道的「场景开关」是否勾选了「插件」。\n"
+                + "\n".join(self._channel_status())
+            )
+
+        try:
+            self.post_message(mtype=_MESSAGE_TYPE, title=title, text=text, image=image)
+        except Exception as error:  # noqa: BLE001 - 测试失败要回给页面而不是抛出
+            message = f"发送失败：{error}"
+            self._remember_test("测试文本" if not with_image else "测试图片", message)
+            return {"success": False, "message": message}
+
+        message = "已提交测试消息"
+        if with_image:
+            message += f"，图片地址自检：{check}"
+        message += "。若未收到，请检查渠道场景开关是否勾选「插件」。"
+        self._remember_test("测试文本" if not with_image else "测试图片", message)
+        logger.info(f"每日入库速报：{message}")
+        return {"success": True, "message": message}
+
+    @staticmethod
+    def _sample_digest() -> Digest:
+        """
+        构造用于图片测试的样例数据，不依赖真实入库记录。
+        """
+        return Digest(
+            day_label="测试",
+            start="",
+            end="",
+            groups=[
+                EpisodeGroup(
+                    title="示例剧集 · 第一季",
+                    media_type="电视剧",
+                    season="S01",
+                    episodes=[1, 2, 3],
+                ),
+                EpisodeGroup(
+                    title="示例电影",
+                    media_type="电影",
+                    year="2026",
+                ),
+            ],
+        )
+
+    def _remember_test(self, kind: str, message: str) -> None:
+        """
+        记录最近一次测试结果，供详情页刷新后展示。
+        """
+        try:
+            self.save_data(
+                "last_test",
+                {
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "kind": kind,
+                    "message": message,
+                },
+            )
+        except Exception as error:  # noqa: BLE001 - 记录失败不影响测试结论
+            logger.debug(f"每日入库速报：保存测试记录失败：{error}")
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
@@ -531,21 +669,37 @@ class DailyEpisodeDigest(_PluginBase):
 
     def get_page(self) -> List[dict]:
         """
-        返回详情页：展示上次推送结果。
+        返回详情页：测试按钮、最近一次测试结果与上次推送摘要。
         """
-        last = self.get_data("last_digest") or {}
-        if not last:
-            return [
+        content: List[dict] = [self._action_bar()]
+
+        test = self.get_data("last_test") or {}
+        if test:
+            content.append(
                 {
                     "component": "VAlert",
                     "props": {
                         "type": "info",
                         "variant": "tonal",
-                        "text": "尚未推送过。可勾选「保存后立即推送一次」验证效果，"
-                        "或在消息渠道发送 /digest_push 手动触发。",
+                        "text": f"最近测试 {test.get('time')}｜{test.get('kind')}｜{test.get('message')}",
                     },
                 }
-            ]
+            )
+
+        last = self.get_data("last_digest") or {}
+        if not last:
+            content.append(
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "warning",
+                        "variant": "tonal",
+                        "text": "尚未推送过。点上方的按钮可以直接测试。",
+                    },
+                }
+            )
+            return content
+
         summary = (
             f"上次推送：{last.get('time') or '-'}｜窗口 {last.get('start')} ~ {last.get('end')}"
             f"｜{last.get('shows', 0)} 部 / {last.get('episodes', 0)} 集"
@@ -553,12 +707,59 @@ class DailyEpisodeDigest(_PluginBase):
         if last.get("movies"):
             summary += f"｜含电影 {last.get('movies')} 部"
         summary += "｜图片已附带" if last.get("image") else "｜纯文本（未生成图片）"
-        return [
+        content.append(
             {
                 "component": "VAlert",
                 "props": {"type": "success", "variant": "tonal", "text": summary},
             }
-        ]
+        )
+        if last.get("image_url"):
+            content.append(
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "info",
+                        "variant": "outlined",
+                        "text": f"图片地址：{last.get('image_url')}\n"
+                        f"地址自检：{last.get('image_check') or '未执行'}",
+                    },
+                }
+            )
+        return content
+
+    def _action_bar(self) -> dict:
+        """
+        构造详情页的操作按钮，点击后调用本插件 API，宿主会自动刷新本页。
+        """
+        plugin_id = self.__class__.__name__
+
+        def button(text: str, path: str, color: str = "primary", variant: str = "tonal") -> dict:
+            return {
+                "component": "VBtn",
+                "props": {
+                    "color": color,
+                    "variant": variant,
+                    "size": "small",
+                    "class": "mr-2 mb-2",
+                },
+                "text": text,
+                "events": {
+                    "click": {
+                        "api": f"plugin/{plugin_id}/{path}",
+                        "method": "post",
+                    }
+                },
+            }
+
+        return {
+            "component": "div",
+            "props": {"class": "d-flex flex-wrap align-center mb-2"},
+            "content": [
+                button("发送测试文本", "test_text"),
+                button("发送测试图片", "test_image"),
+                button("立即推送真实日报", "push_now", color="secondary", variant="outlined"),
+            ],
+        }
 
     def stop_service(self) -> None:
         """
