@@ -15,8 +15,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import HTTPException
+from pydantic import BaseModel, Field
 from starlette.responses import FileResponse
 
+from app import schemas
 from app.schemas.types import EventType, MessageType
 from app.sdk import scheduler as scheduler_sdk
 from app.sdk.config import settings
@@ -36,7 +38,7 @@ from .config import (
     resolve_window,
     split_words,
 )
-from .digest import Digest, EpisodeGroup, build_digest, render
+from .digest import Digest, build_digest, render
 from .fonts import FontBook, locate_font, resolve_font
 
 # 卡片文件名格式，同时用于校验接口入参，杜绝路径穿越
@@ -54,6 +56,17 @@ _MANUAL_COOLDOWN_SECONDS = 60
 _MESSAGE_TYPE = MessageType.Plugin
 
 
+class ActionResultData(BaseModel):
+    """
+    测试与手动推送接口返回的业务数据。
+
+    宿主统一响应要求 success / message / data 三段齐全，图片相关细节放在 data 里。
+    """
+
+    image_url: Optional[str] = Field(default=None, description="本次使用的图片地址")
+    image_check: Optional[str] = Field(default=None, description="图片地址自检结果")
+
+
 class DailyEpisodeDigest(_PluginBase):
     """
     每日新入库剧集与电影的图片日报插件。
@@ -62,7 +75,7 @@ class DailyEpisodeDigest(_PluginBase):
     plugin_name = "每日入库速报"
     plugin_desc = "定时统计每天新入库的剧集与电影，渲染成带封面的日报长图，通过 MoviePilot 通知渠道推送。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.5.0"
+    plugin_version = "2.5.1"
     plugin_label = "媒体库,通知"
     plugin_author = "kongchengll"
     plugin_config_prefix = "dailyepisodedigest_"
@@ -320,24 +333,11 @@ class DailyEpisodeDigest(_PluginBase):
                 "summary": "获取每日入库日报图片",
             },
             {
-                "path": "/test_text",
-                "endpoint": self.api_test_text,
-                "methods": ["POST"],
-                "auth": "bear",
-                "summary": "发送纯文本测试消息",
-            },
-            {
-                "path": "/test_image",
-                "endpoint": self.api_test_image,
-                "methods": ["POST"],
-                "auth": "bear",
-                "summary": "发送带图测试消息",
-            },
-            {
                 "path": "/push_now",
                 "endpoint": self.api_push_now,
                 "methods": ["POST"],
                 "auth": "bear",
+                "response_model": schemas.Response[ActionResultData],
                 "summary": "立即推送真实日报",
             },
         ]
@@ -376,27 +376,11 @@ class DailyEpisodeDigest(_PluginBase):
             }
         ]
 
-    def api_test_text(self) -> Dict[str, Any]:
-        """
-        发送一条纯文本测试消息，用于确认通知渠道本身是否通畅。
-
-        :return: 供页面展示的执行结果
-        """
-        return self._run_test(with_image=False)
-
-    def api_test_image(self) -> Dict[str, Any]:
-        """
-        用样例数据生成一张日报图并发送，用于确认图片链路是否通畅。
-
-        :return: 供页面展示的执行结果
-        """
-        return self._run_test(with_image=True)
-
-    def api_push_now(self) -> Dict[str, Any]:
+    def api_push_now(self) -> "schemas.Response[ActionResultData]":
         """
         按当前配置立即推送一次真实日报。
 
-        :return: 供页面展示的执行结果
+        :return: 宿主统一响应结构
         """
         result = self.push_digest()
         if result is None:
@@ -412,69 +396,30 @@ class DailyEpisodeDigest(_PluginBase):
                 f"{'，含图片' if result.get('image') else '，纯文本'}"
             )
         self._remember_test("推送真实日报", message)
-        return {"success": result is not None, "message": message}
-
-    def _run_test(self, *, with_image: bool) -> Dict[str, Any]:
-        """
-        构造并发送测试消息。
-
-        :param with_image: 是否使用样例数据生成配图
-        :return: 供页面展示的执行结果
-        """
-        title = "每日入库速报 · 测试"
-        check: Optional[str] = None
-        image: Optional[str] = None
-        if with_image:
-            image, check = self._build_image(self._sample_digest())
-            if not image:
-                message = "图片未能生成：请检查「外网访问地址」与中文字体，详情见日志"
-                self._remember_test("测试图片", message)
-                return {"success": False, "message": message}
-            text = f"这是一条带图测试消息。图片地址：{image}\n地址自检：{check}"
-        else:
-            text = (
-                "这是一条纯文本测试消息。收到说明通知渠道通畅；"
-                "没收到请检查渠道的「场景开关」是否勾选了「插件」。\n"
-                + "\n".join(self._channel_status())
-            )
-
-        try:
-            self.post_message(mtype=_MESSAGE_TYPE, title=title, text=text, image=image)
-        except Exception as error:  # noqa: BLE001 - 测试失败要回给页面而不是抛出
-            message = f"发送失败：{error}"
-            self._remember_test("测试文本" if not with_image else "测试图片", message)
-            return {"success": False, "message": message}
-
-        if with_image:
-            message = f"已提交带图测试消息。图片地址：{image}｜地址自检：{check}"
-        else:
-            message = "已提交纯文本测试消息。若未收到，请检查渠道场景开关是否勾选「插件」。"
-        self._remember_test("测试文本" if not with_image else "测试图片", message, image, check)
-        logger.info(f"每日入库速报：{message}")
-        return {"success": True, "message": message}
+        return self._as_response(
+            {
+                "success": result is not None,
+                "message": message,
+                "image_url": (result or {}).get("image_url"),
+                "image_check": (result or {}).get("image_check"),
+            }
+        )
 
     @staticmethod
-    def _sample_digest() -> Digest:
+    def _as_response(result: Dict[str, Any]) -> "schemas.Response[ActionResultData]":
         """
-        构造用于图片测试的样例数据，不依赖真实入库记录。
+        把内部结果字典包装成宿主统一响应结构。
+
+        宿主响应模型禁止额外顶层字段且要求 data 存在，直接返回手写字典会让前端
+        报「服务器返回了无效响应」。
         """
-        return Digest(
-            day_label="测试",
-            start="",
-            end="",
-            groups=[
-                EpisodeGroup(
-                    title="示例剧集 · 第一季",
-                    media_type="电视剧",
-                    season="S01",
-                    episodes=[1, 2, 3],
-                ),
-                EpisodeGroup(
-                    title="示例电影",
-                    media_type="电影",
-                    year="2026",
-                ),
-            ],
+        return schemas.Response(
+            success=bool(result.get("success")),
+            message=str(result.get("message") or ""),
+            data=ActionResultData(
+                image_url=result.get("image_url"),
+                image_check=result.get("image_check"),
+            ),
         )
 
     def _remember_test(
@@ -679,7 +624,7 @@ class DailyEpisodeDigest(_PluginBase):
 
     def get_page(self) -> List[dict]:
         """
-        返回详情页：测试按钮、最近一次测试结果与上次推送摘要。
+        返回详情页：手动推送按钮、最近一次操作结果与上次推送摘要。
         """
         content: List[dict] = [self._action_bar()]
 
@@ -691,7 +636,7 @@ class DailyEpisodeDigest(_PluginBase):
                     "props": {
                         "type": "info",
                         "variant": "tonal",
-                        "text": f"最近测试 {test.get('time')}｜{test.get('kind')}\n"
+                        "text": f"最近操作 {test.get('time')}｜{test.get('kind')}\n"
                         f"{test.get('message')}",
                     },
                 }
@@ -705,7 +650,7 @@ class DailyEpisodeDigest(_PluginBase):
                     "props": {
                         "type": "warning",
                         "variant": "tonal",
-                        "text": "尚未推送过。点上方的按钮可以直接测试。",
+                        "text": "尚未推送过。",
                     },
                 }
             )
@@ -724,51 +669,32 @@ class DailyEpisodeDigest(_PluginBase):
                 "props": {"type": "success", "variant": "tonal", "text": summary},
             }
         )
-        if last.get("image_url"):
-            content.append(
-                {
-                    "component": "VAlert",
-                    "props": {
-                        "type": "info",
-                        "variant": "outlined",
-                        "text": f"图片地址：{last.get('image_url')}\n"
-                        f"地址自检：{last.get('image_check') or '未执行'}",
-                    },
-                }
-            )
         return content
 
     def _action_bar(self) -> dict:
         """
         构造详情页的操作按钮，点击后调用本插件 API，宿主会自动刷新本页。
         """
-        plugin_id = self.__class__.__name__
-
-        def button(text: str, path: str, color: str = "primary", variant: str = "tonal") -> dict:
-            return {
-                "component": "VBtn",
-                "props": {
-                    "color": color,
-                    "variant": variant,
-                    "size": "small",
-                    "class": "mr-2 mb-2",
-                },
-                "text": text,
-                "events": {
-                    "click": {
-                        "api": f"plugin/{plugin_id}/{path}",
-                        "method": "post",
-                    }
-                },
-            }
-
         return {
             "component": "div",
             "props": {"class": "d-flex flex-wrap align-center mb-2"},
             "content": [
-                button("发送测试文本", "test_text"),
-                button("发送测试图片", "test_image"),
-                button("立即推送真实日报", "push_now", color="secondary", variant="outlined"),
+                {
+                    "component": "VBtn",
+                    "props": {
+                        "color": "primary",
+                        "variant": "tonal",
+                        "size": "small",
+                        "class": "mr-2 mb-2",
+                    },
+                    "text": "立即推送真实日报",
+                    "events": {
+                        "click": {
+                            "api": f"plugin/{self.__class__.__name__}/push_now",
+                            "method": "post",
+                        }
+                    },
+                }
             ],
         }
 
