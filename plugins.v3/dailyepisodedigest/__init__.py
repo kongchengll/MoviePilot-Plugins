@@ -63,7 +63,7 @@ class DailyEpisodeDigest(_PluginBase):
     plugin_name = "每日入库速报"
     plugin_desc = "定时统计每天新入库的剧集与电影，渲染成带封面的日报长图，通过 MoviePilot 通知渠道推送。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.2.0"
+    plugin_version = "2.3.0"
     plugin_label = "媒体库,通知"
     plugin_author = "kongchengll"
     plugin_config_prefix = "dailyepisodedigest_"
@@ -265,6 +265,9 @@ class DailyEpisodeDigest(_PluginBase):
                 f"上次推送：{last.get('time')}（{last.get('shows')} 部 / "
                 f"{last.get('episodes')} 集，{'含图片' if last.get('image') else '纯文本'}）"
             )
+            if last.get("image_url"):
+                lines.append(f"图片地址：{last.get('image_url')}")
+                lines.append(f"地址自检：{last.get('image_check') or '未执行'}")
         else:
             lines.append("上次推送：无记录")
         return "\n".join(lines)
@@ -604,6 +607,8 @@ class DailyEpisodeDigest(_PluginBase):
             "empty": digest.is_empty,
             "skipped": False,
             "image": False,
+            "image_url": None,
+            "image_check": None,
         }
         if digest.is_empty and not config.get("notify_empty"):
             logger.info(f"每日入库速报：{day_label}无新增入库，按配置跳过推送")
@@ -611,12 +616,14 @@ class DailyEpisodeDigest(_PluginBase):
             return summary
 
         title, fallback_text = render(digest, empty_hint=f"{day_label}没有新入库内容")
-        image = self._build_image(digest)
+        image, image_check = self._build_image(digest)
         # 有图时正文退化为一句概要，作为不支持图片渠道的兜底；无图时正文即完整清单
         text = self._caption(digest) if image else fallback_text
         self._send(title=title, text=text, image=image)
-        self._remember(digest, title, text, image)
+        self._remember(digest, title, text, image, image_check)
         summary["image"] = bool(image)
+        summary["image_url"] = image
+        summary["image_check"] = image_check
         return summary
 
     def _caption(self, digest: Digest) -> str:
@@ -637,27 +644,52 @@ class DailyEpisodeDigest(_PluginBase):
 
     def _build_image(self, digest: Digest) -> Optional[str]:
         """
-        生成日报图片并返回可被通知渠道访问的地址，任一步失败返回 None。
+        生成日报图片并返回可被通知渠道访问的地址。
+
+        :return: `(图片地址, 自检结果)`，任一步失败时地址为 None
         """
         if digest.is_empty:
-            return None
+            return None, None
         base = self._public_base()
         if not base:
             logger.warning("每日入库速报：未配置可公网访问的地址，本次降级为纯文本推送")
-            return None
+            return None, None
 
         font_book = self._ensure_font()
         if font_book is None:
-            return None
+            return None, None
 
         name = f"digest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         data_path = self.get_data_path()
         target = data_path / name
         if not render_card(digest, font_book, target, max_rows=int(self._config.get("image_items") or 8)):
             logger.warning("每日入库速报：日报图片生成失败，本次降级为纯文本推送")
-            return None
+            return None, None
         prune_old_cards(data_path)
-        return f"{base}{_API_PREFIX}/{self.__class__.__name__}/card/{name}"
+
+        url = f"{base}{_API_PREFIX}/{self.__class__.__name__}/card/{name}"
+        size = target.stat().st_size if target.is_file() else 0
+        logger.info(f"每日入库速报：日报图片已生成 {target}（{size} 字节），对外地址 {url}")
+        check = self._verify_image_url(url)
+        logger.info(f"每日入库速报：图片地址自检 {check}")
+        return url, check
+
+    @staticmethod
+    def _verify_image_url(url: str) -> str:
+        """
+        从宿主内部请求一次图片地址，用于判断地址是否可达。
+
+        容器内访问自身公网域名可能受回环/NAT 影响，失败不代表外部不可用；
+        但返回 200 说明链路完全正常，返回 4xx 则说明路径或鉴权有问题。
+        """
+        try:
+            import httpx2
+
+            with httpx2.Client(timeout=8.0, follow_redirects=True) as client:
+                response = client.get(url)
+            return f"HTTP {response.status_code}"
+        except Exception as error:  # noqa: BLE001 - 自检失败只作为诊断信息
+            return f"请求失败（{error}）"
 
     def _ensure_font(self) -> Optional[FontBook]:
         """
@@ -687,9 +719,16 @@ class DailyEpisodeDigest(_PluginBase):
         except Exception as error:  # noqa: BLE001 - 通知失败不应中断插件
             logger.error(f"每日入库速报：发送通知失败：{error}")
 
-    def _remember(self, digest: Digest, title: str, text: str, image: Optional[str]) -> None:
+    def _remember(
+        self,
+        digest: Digest,
+        title: str,
+        text: str,
+        image: Optional[str],
+        image_check: Optional[str] = None,
+    ) -> None:
         """
-        缓存本次推送结果，供详情页展示。
+        缓存本次推送结果，供详情页与诊断命令展示。
         """
         try:
             self.save_data(
@@ -704,6 +743,8 @@ class DailyEpisodeDigest(_PluginBase):
                     "episodes": digest.total_episodes,
                     "movies": digest.total_movies,
                     "image": image,
+                    "image_url": image,
+                    "image_check": image_check,
                 },
             )
         except Exception as error:  # noqa: BLE001 - 缓存失败不影响推送结果
