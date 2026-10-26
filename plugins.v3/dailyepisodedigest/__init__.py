@@ -12,7 +12,6 @@ import re
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import HTTPException
@@ -63,7 +62,7 @@ class DailyEpisodeDigest(_PluginBase):
     plugin_name = "每日入库速报"
     plugin_desc = "定时统计每天新入库的剧集与电影，渲染成带封面的日报长图，通过 MoviePilot 通知渠道推送。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.4.0"
+    plugin_version = "2.5.0"
     plugin_label = "媒体库,通知"
     plugin_author = "kongchengll"
     plugin_config_prefix = "dailyepisodedigest_"
@@ -248,8 +247,9 @@ class DailyEpisodeDigest(_PluginBase):
         lines.append(f"统计类型：{media_types}")
         lines.append(f"无新增也推送：{'是' if self._config.get('notify_empty') else '否'}")
 
-        base = self._public_base()
-        lines.append(f"外网地址：{base or '不可用（只会发纯文本）'}")
+        candidates = self._base_candidates()
+        lines.append(f"图片地址候选：{' → '.join(candidates)}")
+        lines.append("（前两个需能被宿主解析；最后一个仅 Telegram/微信 等由宿主下载图片的渠道可用）")
 
         font_path, font_note = locate_font(
             self.get_data_path(), self._config.get("font_path", "")
@@ -430,7 +430,7 @@ class DailyEpisodeDigest(_PluginBase):
                 message = "图片未能生成：请检查「外网访问地址」与中文字体，详情见日志"
                 self._remember_test("测试图片", message)
                 return {"success": False, "message": message}
-            text = f"这是一条带图测试消息，图片地址自检：{check}。"
+            text = f"这是一条带图测试消息。图片地址：{image}\n地址自检：{check}"
         else:
             text = (
                 "这是一条纯文本测试消息。收到说明通知渠道通畅；"
@@ -445,11 +445,11 @@ class DailyEpisodeDigest(_PluginBase):
             self._remember_test("测试文本" if not with_image else "测试图片", message)
             return {"success": False, "message": message}
 
-        message = "已提交测试消息"
         if with_image:
-            message += f"，图片地址自检：{check}"
-        message += "。若未收到，请检查渠道场景开关是否勾选「插件」。"
-        self._remember_test("测试文本" if not with_image else "测试图片", message)
+            message = f"已提交带图测试消息。图片地址：{image}｜地址自检：{check}"
+        else:
+            message = "已提交纯文本测试消息。若未收到，请检查渠道场景开关是否勾选「插件」。"
+        self._remember_test("测试文本" if not with_image else "测试图片", message, image, check)
         logger.info(f"每日入库速报：{message}")
         return {"success": True, "message": message}
 
@@ -477,7 +477,13 @@ class DailyEpisodeDigest(_PluginBase):
             ],
         )
 
-    def _remember_test(self, kind: str, message: str) -> None:
+    def _remember_test(
+        self,
+        kind: str,
+        message: str,
+        image_url: Optional[str] = None,
+        image_check: Optional[str] = None,
+    ) -> None:
         """
         记录最近一次测试结果，供详情页刷新后展示。
         """
@@ -488,6 +494,8 @@ class DailyEpisodeDigest(_PluginBase):
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "kind": kind,
                     "message": message,
+                    "image_url": image_url,
+                    "image_check": image_check,
                 },
             )
         except Exception as error:  # noqa: BLE001 - 记录失败不影响测试结论
@@ -636,9 +644,11 @@ class DailyEpisodeDigest(_PluginBase):
                                             "variant": "tonal",
                                             "text": "【重要】通知渠道的「场景开关」必须勾选「插件」，"
                                             "否则宿主的 check_message 会把本插件的广播消息直接丢弃且不写日志。"
-                                            "保存后可在消息渠道发送 /digest_status 查看诊断。"
-                                            "日报图片由插件生成后以链接形式交给通知渠道，"
-                                            "因此必须配置可公网访问的地址，否则会降级为纯文本推送。"
+                                            "保存后可在消息渠道发送 /digest_status 查看诊断，"
+                                            "或点详情页的测试按钮验证。"
+                                            "日报图片以链接形式交给渠道，插件会依次实测「外网访问地址 → 宿主域名 → 容器内地址」，"
+                                            "取第一个可访问的；外网地址解析不了时会回退到容器内地址，"
+                                            "此时 Telegram、微信能正常收图，钉钉、飞书这类由客户端拉图的渠道会看不到图。"
                                             "MoviePilot 镜像不含中文字体，插件会在首次出图时自动下载并缓存到插件数据目录；"
                                             "离线环境可把任意中文字体放到插件目录 fonts/ 下，或用「中文字体路径」指定。"
                                             "统计口径为 MoviePilot 整理入库记录，手工放入媒体库的文件不计入。"
@@ -681,7 +691,8 @@ class DailyEpisodeDigest(_PluginBase):
                     "props": {
                         "type": "info",
                         "variant": "tonal",
-                        "text": f"最近测试 {test.get('time')}｜{test.get('kind')}｜{test.get('message')}",
+                        "text": f"最近测试 {test.get('time')}｜{test.get('kind')}\n"
+                        f"{test.get('message')}",
                     },
                 }
             )
@@ -843,17 +854,16 @@ class DailyEpisodeDigest(_PluginBase):
             parts.append(f"{digest.total_movies} 部电影")
         return "共 " + " · ".join(parts) if parts else "无入库"
 
-    def _build_image(self, digest: Digest) -> Optional[str]:
+    def _build_image(self, digest: Digest) -> Tuple[Optional[str], Optional[str]]:
         """
         生成日报图片并返回可被通知渠道访问的地址。
+
+        外网地址可能无法从宿主内部解析（DDNS、内网 DNS 等），因此逐个候选地址实测，
+        取第一个返回 200 的地址；都不通时保留首个候选，交给渠道自行判断。
 
         :return: `(图片地址, 自检结果)`，任一步失败时地址为 None
         """
         if digest.is_empty:
-            return None, None
-        base = self._public_base()
-        if not base:
-            logger.warning("每日入库速报：未配置可公网访问的地址，本次降级为纯文本推送")
             return None, None
 
         font_book = self._ensure_font()
@@ -868,12 +878,30 @@ class DailyEpisodeDigest(_PluginBase):
             return None, None
         prune_old_cards(data_path)
 
-        url = f"{base}{_API_PREFIX}/{self.__class__.__name__}/card/{name}"
+        route = f"{_API_PREFIX}/{self.__class__.__name__}/card/{name}"
+        chosen: Optional[str] = None
+        chosen_check: Optional[str] = None
+        for index, base in enumerate(self._base_candidates()):
+            url = f"{base}{route}"
+            check = self._verify_image_url(url)
+            if chosen is None:
+                chosen, chosen_check = url, check
+            if check == "HTTP 200":
+                chosen, chosen_check = url, check
+                if index > 0:
+                    logger.warning(
+                        f"每日入库速报：外网地址不可用，图片改由 {base} 提供；"
+                        "该回退只对由宿主下载图片的渠道（Telegram、微信）有效，"
+                        "钉钉、飞书这类由客户端拉图的渠道会看不到图"
+                    )
+                break
+
         size = target.stat().st_size if target.is_file() else 0
-        logger.info(f"每日入库速报：日报图片已生成 {target}（{size} 字节），对外地址 {url}")
-        check = self._verify_image_url(url)
-        logger.info(f"每日入库速报：图片地址自检 {check}")
-        return url, check
+        logger.info(
+            f"每日入库速报：日报图片已生成 {target}（{size} 字节），"
+            f"使用地址 {chosen}，自检 {chosen_check}"
+        )
+        return chosen, chosen_check
 
     @staticmethod
     def _verify_image_url(url: str) -> str:
@@ -951,24 +979,38 @@ class DailyEpisodeDigest(_PluginBase):
         except Exception as error:  # noqa: BLE001 - 缓存失败不影响推送结果
             logger.warning(f"每日入库速报：保存推送记录失败：{error}")
 
-    def _public_base(self) -> Optional[str]:
+    def _base_candidates(self) -> List[str]:
         """
-        取可用于外部抓图的基础地址，内网或回环地址视为不可用。
+        按优先级返回图片基础地址候选。
+
+        前两项来自插件配置与宿主设置；最后一项指向容器自身的回环端口，用于外网地址
+        在宿主内解析不了时兜底。Telegram、微信等渠道由宿主先下载图片字节再上传，
+        回环地址同样可用；钉钉、飞书这类由客户端拉图的渠道则不行。
         """
-        candidate = (self._config.get("public_domain") or "").strip().rstrip("/")
-        if not candidate:
-            try:
-                candidate = (settings.MP_DOMAIN("") or "").rstrip("/")
-            except Exception as error:  # noqa: BLE001 - 宿主未配置域名时降级
-                logger.debug(f"每日入库速报：读取外网地址失败：{error}")
-                return None
-        if not candidate:
-            return None
-        if not candidate.startswith(("http://", "https://")):
-            candidate = f"http://{candidate}"
-        host = urlparse(candidate).hostname or ""
-        if not host or "." not in host:
-            return None
-        if host.startswith(("localhost", "127.", "10.", "192.168.", "172.16.", "172.17.", "172.18.")):
-            return None
-        return candidate
+        raw: List[str] = []
+        custom = (self._config.get("public_domain") or "").strip()
+        if custom:
+            raw.append(custom)
+        try:
+            domain = settings.MP_DOMAIN("") or ""
+            if domain:
+                raw.append(domain)
+        except Exception as error:  # noqa: BLE001 - 宿主未配置域名时降级
+            logger.debug(f"每日入库速报：读取外网地址失败：{error}")
+
+        try:
+            port = int(getattr(settings, "PORT", 3001) or 3001)
+        except Exception:  # noqa: BLE001 - 端口读取失败时用默认值
+            port = 3001
+        raw.append(f"http://127.0.0.1:{port}")
+
+        candidates: List[str] = []
+        for item in raw:
+            value = item.strip().rstrip("/")
+            if not value:
+                continue
+            if not value.startswith(("http://", "https://")):
+                value = f"http://{value}"
+            if value not in candidates:
+                candidates.append(value)
+        return candidates
