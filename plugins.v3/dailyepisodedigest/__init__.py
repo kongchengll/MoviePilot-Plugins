@@ -77,7 +77,7 @@ class DailyEpisodeDigest(_PluginBase):
     plugin_name = "每日入库速报"
     plugin_desc = "定时统计每天新入库的剧集与电影，渲染成带封面的日报长图，通过 MoviePilot 通知渠道推送。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.6.0"
+    plugin_version = "2.6.1"
     plugin_label = "媒体库,通知"
     plugin_author = "kongchengll"
     plugin_config_prefix = "dailyepisodedigest_"

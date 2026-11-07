@@ -6,12 +6,15 @@
 
 接口地址：https://piaofang.maoyan.com/dashboard-ajax/movie
 该接口无需签名或 token，直接 GET 即可返回完整 JSON。
+
+注意：猫眼接口数据结构会不定期变更，解析时同时兼容新旧字段。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from datetime import datetime
+from typing import Any, List, Optional
 
 import httpx2
 
@@ -37,8 +40,8 @@ class BoxOfficeMovie:
 
     rank: int = 0
     title: str = ""
-    realtime_box: str = ""       # 实时票房（万元）
-    total_box: str = ""          # 累计票房（万元）
+    realtime_box: str = ""       # 实时票房（带单位）
+    total_box: str = ""          # 累计票房（带单位）
     box_rate: str = ""           # 票房占比
     show_rate: str = ""          # 排片占比
 
@@ -61,11 +64,34 @@ class BoxOfficeData:
         return self.error is None and bool(self.movies)
 
 
-def _safe_str(value) -> str:
+def _safe_str(value: Any) -> str:
     """安全转换为字符串，None 返回空串。"""
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _split_unit_text(obj: Any) -> str:
+    """
+    处理猫眼新结构 {num, unit}，拼接为 "4984.3万" 这样的文本。
+    如果传入的不是字典则退化为字符串。
+    """
+    if isinstance(obj, dict):
+        num = _safe_str(obj.get("num"))
+        unit = _safe_str(obj.get("unit"))
+        return f"{num}{unit}" if num else ""
+    return _safe_str(obj)
+
+
+def _format_timestamp(ts: Any) -> str:
+    """
+    把毫秒时间戳格式化为 HH:MM。
+    """
+    try:
+        seconds = int(ts) / 1000
+        return datetime.fromtimestamp(seconds).strftime("%H:%M")
+    except (TypeError, ValueError, OSError):
+        return ""
 
 
 def fetch_boxoffice(top_n: int = 5) -> BoxOfficeData:
@@ -88,23 +114,56 @@ def fetch_boxoffice(top_n: int = 5) -> BoxOfficeData:
     movie_list = payload.get("movieList") or {}
     nation = movie_list.get("nationBoxInfo") or {}
 
+    # 大盘：兼容新旧字段
+    total_box = (
+        _split_unit_text(nation.get("nationBoxSplitUnit"))
+        or _safe_str(nation.get("sumBoxDesc"))
+    )
+    split_box = (
+        _split_unit_text(nation.get("nationSplitBoxSplitUnit"))
+        or _safe_str(nation.get("splitSumBox"))
+    )
+    show_count = _safe_str(nation.get("showCountDesc")) or _safe_str(nation.get("showCount"))
+    audience_count = _safe_str(nation.get("viewCountDesc")) or _safe_str(nation.get("peopleCount"))
+
+    # 更新时间：新结构在 movieList.updateInfo.updateTimestamp（毫秒），旧结构是字符串
+    update_time = ""
+    update_info = movie_list.get("updateInfo")
+    if isinstance(update_info, dict):
+        update_time = _format_timestamp(update_info.get("updateTimestamp"))
+    elif update_info:
+        update_time = _safe_str(update_info)
+
     data = BoxOfficeData(
-        total_box=_safe_str(nation.get("sumBoxDesc")),
-        split_box=_safe_str(nation.get("splitSumBox")),
-        show_count=_safe_str(nation.get("showCount")),
-        audience_count=_safe_str(nation.get("peopleCount")),
-        update_time=_safe_str(nation.get("updateInfo")),
+        total_box=total_box,
+        split_box=split_box,
+        show_count=show_count,
+        audience_count=audience_count,
+        update_time=update_time,
     )
 
     raw_movies = movie_list.get("list") or []
     for index, item in enumerate(raw_movies[:top_n]):
+        # 电影名：新结构在 movieInfo.movieName，旧结构直接 movieName
+        movie_info = item.get("movieInfo") or {}
+        title = _safe_str(movie_info.get("movieName")) or _safe_str(item.get("movieName"))
+
+        # 实时票房：新结构 boxSplitUnit {num,unit}，旧结构 boxDesc
+        realtime_box = _split_unit_text(item.get("boxSplitUnit")) or _safe_str(item.get("boxDesc"))
+
+        # 累计票房：新旧都有 sumBoxDesc
+        total_box_str = _safe_str(item.get("sumBoxDesc"))
+
+        box_rate = _safe_str(item.get("boxRate"))
+        show_rate = _safe_str(item.get("showRate"))
+
         movie = BoxOfficeMovie(
             rank=index + 1,
-            title=_safe_str(item.get("movieName")),
-            realtime_box=_safe_str(item.get("boxDesc")),
-            total_box=_safe_str(item.get("sumBoxDesc")),
-            box_rate=_safe_str(item.get("boxRate")),
-            show_rate=_safe_str(item.get("showRate")),
+            title=title,
+            realtime_box=realtime_box,
+            total_box=total_box_str,
+            box_rate=box_rate,
+            show_rate=show_rate,
         )
         if movie.title:
             data.movies.append(movie)
