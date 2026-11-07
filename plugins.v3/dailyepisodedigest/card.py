@@ -13,6 +13,7 @@ from typing import Any, Optional
 
 from app.sdk.logging import logger
 
+from .boxoffice import BoxOfficeData
 from .digest import Digest, EpisodeGroup, group_detail, short_time
 from .fonts import FontBook
 
@@ -40,6 +41,13 @@ _MUTED = (150, 159, 174)
 _DIM = (108, 116, 130)
 _ACCENT = (91, 157, 255)
 _LINE = (42, 48, 60)
+
+# 票房区域布局参数
+_BOXOFFICE_TOP_PAD = 50
+_BOXOFFICE_TITLE_HEIGHT = 44
+_BOXOFFICE_SUMMARY_HEIGHT = 36
+_BOXOFFICE_ROW_HEIGHT = 56
+_BOXOFFICE_BOTTOM_PAD = 62
 
 
 def _lerp(begin: tuple[int, int, int], end: tuple[int, int, int], ratio: float) -> tuple[int, int, int]:
@@ -148,11 +156,117 @@ def _row_time(group: EpisodeGroup) -> str:
     return f"入库 {stamp}" if stamp else ""
 
 
+def _boxoffice_height(boxoffice: Optional[BoxOfficeData]) -> int:
+    """
+    计算票房区域占用的总高度。无效数据返回 0。
+    """
+    if not boxoffice or not boxoffice.is_valid:
+        return 0
+    movies_count = len(boxoffice.movies)
+    return (
+        _BOXOFFICE_TOP_PAD
+        + _BOXOFFICE_TITLE_HEIGHT
+        + _BOXOFFICE_SUMMARY_HEIGHT
+        + movies_count * _BOXOFFICE_ROW_HEIGHT
+        + _BOXOFFICE_BOTTOM_PAD
+    )
+
+
+def _draw_boxoffice(draw: Any, canvas: Any, boxoffice: BoxOfficeData, top: int, font_book: FontBook) -> None:
+    """
+    在指定位置绘制票房区域。
+    """
+    from PIL import Image, ImageDraw
+
+    y = top + _BOXOFFICE_TOP_PAD
+
+    # 分隔线
+    draw.line([(_PAD, top + 20), (_WIDTH - _PAD, top + 20)], fill=_LINE, width=2)
+
+    # 标题行
+    font_box_title = font_book.get(30)
+    draw.text((_PAD, y), "今日猫眼票房", font=font_box_title, fill=_TEXT, anchor="lm")
+    if boxoffice.update_time:
+        font_box_time = font_book.get(20)
+        draw.text(
+            (_WIDTH - _PAD, y),
+            boxoffice.update_time,
+            font=font_box_time,
+            fill=_DIM,
+            anchor="rm",
+        )
+    y += _BOXOFFICE_TITLE_HEIGHT
+
+    # 大盘摘要
+    font_box_summary = font_book.get(22)
+    summary_parts: list[str] = []
+    if boxoffice.total_box:
+        summary_parts.append(f"大盘 {boxoffice.total_box}")
+    if boxoffice.split_box:
+        summary_parts.append(f"分账 {boxoffice.split_box}")
+    if boxoffice.show_count:
+        summary_parts.append(f"{boxoffice.show_count}场")
+    if boxoffice.audience_count:
+        summary_parts.append(f"{boxoffice.audience_count}人")
+    if summary_parts:
+        summary_text = "  ·  ".join(summary_parts)
+        draw.text((_PAD, y), summary_text, font=font_box_summary, fill=_MUTED, anchor="lm")
+    y += _BOXOFFICE_SUMMARY_HEIGHT
+
+    # 榜单逐行
+    font_box_row = font_book.get(24)
+    font_box_rank = font_book.get(18)
+    text_left_row = _PAD + 48
+    box_right = _WIDTH - _PAD
+
+    for movie in boxoffice.movies:
+        # 排名圆背景
+        rank_color = _ACCENT if movie.rank <= 3 else _DIM
+        draw.ellipse(
+            (_PAD, y + 4, _PAD + 32, y + 36),
+            fill=rank_color,
+        )
+        draw.text(
+            (_PAD + 16, y + 20),
+            str(movie.rank),
+            font=font_box_rank,
+            fill=(255, 255, 255),
+            anchor="mm",
+        )
+
+        # 电影名（截断）
+        title_text = _ellipsize(draw, movie.title, font_box_row, box_right - text_left_row - 180)
+        draw.text((text_left_row, y + 20), title_text, font=font_box_row, fill=_TEXT, anchor="lm")
+
+        # 实时票房（右对齐）
+        if movie.realtime_box:
+            draw.text(
+                (box_right, y + 20),
+                movie.realtime_box,
+                font=font_box_summary,
+                fill=_ACCENT,
+                anchor="rm",
+            )
+
+        # 累计票房（右下，小字）
+        if movie.total_box:
+            draw.text(
+                (box_right, y + 44),
+                f"累计 {movie.total_box}",
+                font=font_box_rank,
+                fill=_DIM,
+                anchor="rm",
+            )
+
+        y += _BOXOFFICE_ROW_HEIGHT
+
+
 def render_card(
     digest: Digest,
     font_book: FontBook,
     target: Path,
     max_rows: int = _MAX_ROWS,
+    boxoffice: Optional[BoxOfficeData] = None,
 ) -> Optional[Path]:
     """
     绘制日报卡片并保存为 JPEG。
@@ -189,7 +303,8 @@ def render_card(
     rows_top = header_height + 8
     rows_height = len(rows) * _POSTER_HEIGHT + max(0, len(rows) - 1) * _ROW_GAP
     footer_area = 104 if hidden else 76
-    height = rows_top + rows_height + footer_area
+    boxoffice_h = _boxoffice_height(boxoffice)
+    height = rows_top + rows_height + footer_area + boxoffice_h
 
     canvas = Image.new("RGB", (_WIDTH, height), _BG_TOP)
     _draw_gradient(canvas, height)
@@ -252,6 +367,11 @@ def render_card(
         if index < len(rows) - 1:
             sep_y = top + _POSTER_HEIGHT + _ROW_GAP // 2
             draw.line([(_PAD, sep_y), (_WIDTH - _PAD, sep_y)], fill=_LINE, width=1)
+
+    # 票房区域
+    if boxoffice and boxoffice.is_valid:
+        boxoffice_top = rows_top + rows_height + footer_area
+        _draw_boxoffice(draw, canvas, boxoffice, boxoffice_top, font_book)
 
     # 底部
     if hidden:

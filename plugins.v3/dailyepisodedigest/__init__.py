@@ -26,6 +26,7 @@ from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
 from app.sdk.plugin import _PluginBase
 
+from .boxoffice import fetch_boxoffice
 from .card import prune_old_cards, render_card
 from .collector import fetch_records
 from .config import (
@@ -50,6 +51,7 @@ _API_PREFIX = "/api/v1/plugin"
 # 远程命令的动作标识，同时用于命令声明与事件判定
 _ACTION_PUSH = "digest_push"
 _ACTION_STATUS = "digest_status"
+_ACTION_TRIGGER = "digest_trigger"
 # 手动触发的冷却时间，避免连续发命令刷屏
 _MANUAL_COOLDOWN_SECONDS = 60
 # 本插件通知使用的场景类型，渠道必须在场景开关里勾选该值才能收到
@@ -75,7 +77,7 @@ class DailyEpisodeDigest(_PluginBase):
     plugin_name = "每日入库速报"
     plugin_desc = "定时统计每天新入库的剧集与电影，渲染成带封面的日报长图，通过 MoviePilot 通知渠道推送。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.5.1"
+    plugin_version = "2.6.0"
     plugin_label = "媒体库,通知"
     plugin_author = "kongchengll"
     plugin_config_prefix = "dailyepisodedigest_"
@@ -152,12 +154,15 @@ class DailyEpisodeDigest(_PluginBase):
         """
         return self._enabled
 
-    @staticmethod
-    def get_command() -> List[Dict[str, Any]]:
+    def get_command(self) -> List[Dict[str, Any]]:
         """
         注册远程命令，供用户在消息渠道里手动触发推送或查看诊断信息。
+
+        自定义触发词从配置中读取，缺省为 /入库速报；
+        同时保留 /digest_push 和 /digest_status 两个固定命令。
         """
-        return [
+        trigger = str(self._config.get("trigger_word") or "/入库速报").strip()
+        commands: List[Dict[str, Any]] = [
             {
                 "cmd": "/digest_push",
                 "event": EventType.PluginAction,
@@ -173,6 +178,18 @@ class DailyEpisodeDigest(_PluginBase):
                 "data": {"action": _ACTION_STATUS},
             },
         ]
+        # 注册自定义触发词（与 /digest_push 等效），避免与固定命令重复
+        if trigger and trigger not in {"/digest_push", "/digest_status"}:
+            commands.append(
+                {
+                    "cmd": trigger,
+                    "event": EventType.PluginAction,
+                    "desc": "立即推送每日入库速报（自定义触发词）",
+                    "category": "插件命令",
+                    "data": {"action": _ACTION_TRIGGER},
+                }
+            )
+        return commands
 
     @eventmanager.register(EventType.PluginAction)
     def on_plugin_action(self, event: Event) -> None:
@@ -184,7 +201,7 @@ class DailyEpisodeDigest(_PluginBase):
         """
         event_data = event.event_data if isinstance(event.event_data, dict) else {}
         action = event_data.get("action")
-        if action not in (_ACTION_PUSH, _ACTION_STATUS):
+        if action not in (_ACTION_PUSH, _ACTION_STATUS, _ACTION_TRIGGER):
             return
 
         channel = event_data.get("channel")
@@ -580,6 +597,42 @@ class DailyEpisodeDigest(_PluginBase):
                         "component": "VRow",
                         "content": [
                             self._col(
+                                6,
+                                [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "trigger_word",
+                                            "label": "自定义触发词",
+                                            "placeholder": "如 /入库速报，须以 / 开头",
+                                        },
+                                    }
+                                ],
+                            ),
+                            self._col(
+                                3,
+                                [self._switch("show_boxoffice", "图片追加票房")],
+                            ),
+                            self._col(
+                                3,
+                                [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "boxoffice_items",
+                                            "label": "票房榜前几名",
+                                            "type": "number",
+                                            "placeholder": "1-10",
+                                        },
+                                    }
+                                ],
+                            ),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self._col(
                                 12,
                                 [
                                     {
@@ -587,17 +640,19 @@ class DailyEpisodeDigest(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "【重要】通知渠道的「场景开关」必须勾选「插件」，"
-                                            "否则宿主的 check_message 会把本插件的广播消息直接丢弃且不写日志。"
-                                            "保存后可在消息渠道发送 /digest_status 查看诊断，"
-                                            "或点详情页的测试按钮验证。"
-                                            "日报图片以链接形式交给渠道，插件会依次实测「外网访问地址 → 宿主域名 → 容器内地址」，"
-                                            "取第一个可访问的；外网地址解析不了时会回退到容器内地址，"
-                                            "此时 Telegram、微信能正常收图，钉钉、飞书这类由客户端拉图的渠道会看不到图。"
-                                            "MoviePilot 镜像不含中文字体，插件会在首次出图时自动下载并缓存到插件数据目录；"
-                                            "离线环境可把任意中文字体放到插件目录 fonts/ 下，或用「中文字体路径」指定。"
-                                            "统计口径为 MoviePilot 整理入库记录，手工放入媒体库的文件不计入。"
-                                            "手动触发：/digest_push，支持 /digest_push today 或 24h 临时切换统计范围。",
+                                        "text": "【重要】通知渠道的「场景开关」必须勾选「插件」，"
+                                        "否则宿主的 check_message 会把本插件的广播消息直接丢弃且不写日志。"
+                                        "保存后可在消息渠道发送 /digest_status 查看诊断。"
+                                        "有图片时不再附带文字摘要，只发图片。"
+                                        "手动触发：/digest_push，也可使用配置的「自定义触发词」直接触发推送，"
+                                        "支持 /digest_push today 或 24h 临时切换统计范围。"
+                                        "开启「图片追加票房」后，日报末尾会展示猫眼实时票房榜单。"
+                                        "日报图片以链接形式交给渠道，插件会依次实测「外网访问地址 → 宿主域名 → 容器内地址」，"
+                                        "取第一个可访问的；外网地址解析不了时会回退到容器内地址，"
+                                        "此时 Telegram、微信能正常收图，钉钉、飞书这类由客户端拉图的渠道会看不到图。"
+                                        "MoviePilot 镜像不含中文字体，插件会在首次出图时自动下载并缓存到插件数据目录；"
+                                        "离线环境可把任意中文字体放到插件目录 fonts/ 下，或用「中文字体路径」指定。"
+                                        "统计口径为 MoviePilot 整理入库记录，手工放入媒体库的文件不计入。",
                                         },
                                     }
                                 ],
@@ -799,7 +854,19 @@ class DailyEpisodeDigest(_PluginBase):
         name = f"digest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         data_path = self.get_data_path()
         target = data_path / name
-        if not render_card(digest, font_book, target, max_rows=int(self._config.get("image_items") or 8)):
+
+        # 票房数据
+        boxoffice = None
+        if self._config.get("show_boxoffice"):
+            boxoffice = fetch_boxoffice(top_n=int(self._config.get("boxoffice_items") or 5))
+            if boxoffice.error:
+                logger.warning(f"每日入库速报：票房数据获取失败，跳过票房区域：{boxoffice.error}")
+
+        if not render_card(
+            digest, font_book, target,
+            max_rows=int(self._config.get("image_items") or 8),
+            boxoffice=boxoffice,
+        ):
             logger.warning("每日入库速报：日报图片生成失败，本次降级为纯文本推送")
             return None, None
         prune_old_cards(data_path)
@@ -857,13 +924,16 @@ class DailyEpisodeDigest(_PluginBase):
     def _send(self, *, title: str, text: str, image: Optional[str]) -> None:
         """
         通过宿主通知渠道发送消息。
+
+        有图片时正文传空字符串，避免图片下方出现多余的文本栏；
+        无图片时正文即为完整清单。
         """
         link = settings.MP_DOMAIN("#/history")
         try:
             self.post_message(
                 mtype=MessageType.Plugin,
                 title=title,
-                text=text,
+                text="" if image else text,
                 image=image,
                 link=link,
             )

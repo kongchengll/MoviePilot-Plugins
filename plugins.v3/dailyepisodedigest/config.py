@@ -45,6 +45,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "font_path": "",
     "notify_empty": True,
     "run_once": False,
+    # 自定义触发词，用户在消息渠道发送此词触发推送
+    "trigger_word": "/入库速报",
+    # 票房区域开关与展示数量
+    "show_boxoffice": True,
+    "boxoffice_items": 5,
 }
 
 _TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -104,6 +109,15 @@ def normalize_config(config: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     result["font_path"] = str(raw.get("font_path") or "").strip()
     result["notify_empty"] = _as_bool(raw.get("notify_empty"), DEFAULT_CONFIG["notify_empty"])
     result["run_once"] = _as_bool(raw.get("run_once"), False)
+
+    # 自定义触发词：确保以 / 开头，去空白
+    trigger = str(raw.get("trigger_word") if raw.get("trigger_word") is not None else DEFAULT_CONFIG["trigger_word"]).strip()
+    if trigger and not trigger.startswith("/"):
+        trigger = "/" + trigger
+    result["trigger_word"] = trigger or DEFAULT_CONFIG["trigger_word"]
+
+    result["show_boxoffice"] = _as_bool(raw.get("show_boxoffice"), DEFAULT_CONFIG["show_boxoffice"])
+    result["boxoffice_items"] = _as_int(raw.get("boxoffice_items"), DEFAULT_CONFIG["boxoffice_items"], 1, 10)
     return result
 
 
