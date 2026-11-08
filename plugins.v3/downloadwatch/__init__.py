@@ -1,11 +1,12 @@
 """
 下载监控插件主入口。
 
-职责：按配置周期扫描下载器任务，把「已等待时长 ≥ X 小时且进度 ≤ Y%」的任务判定为
-卡死，删除任务（可选连文件一起删），并把该种子记入本地黑名单；黑名单里的种子
-再次被订阅下载时会被立即清理，从而避免同一个坏种子反复占用下载位。
+职责：按配置周期扫描下载器中「正在下载」的任务，把「已等待时长 ≥ X 小时且进度 ≤ Y%」
+的任务判定为卡死，删除任务（可选连文件一起删），并把该种子记入本地黑名单；黑名单里的
+种子再次被订阅下载时会被立即清理，从而避免同一个坏种子反复占用下载位。
 可选地把种子标题追加进对应订阅的排除规则，从源头阻止重复下载。
-详情页展示监控中与已删除的任务列表，任务进入监控与被删除时均可推送通知。
+详情页用四个按钮切换监控中、已删除、黑名单与最近命中四个列表，任务进入监控与被删除
+时均可推送通知。
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from app.sdk.plugin import _PluginBase
 from .config import (
     DEFAULT_CONFIG,
     MAX_BLACKLIST,
+    MAX_LIST_ROWS,
     MAX_NOTIFY_LINES,
     MAX_REMOVED_RECORDS,
     MAX_WATCH_RECORDS,
@@ -45,6 +47,7 @@ from .monitor import (
     evaluate,
     format_duration,
     format_size,
+    is_downloading,
     is_finished,
     progress_text,
     reason_text,
@@ -56,6 +59,16 @@ _STATE_KEY = "watch_state"
 _RECORDS_KEY = "watch_records"
 # 最近一次扫描结果的持久化键，供详情页在实例重建后仍能展示
 _LAST_SCAN_KEY = "last_scan"
+# 详情页当前选中分页的持久化键
+_PAGE_TAB_KEY = "page_tab"
+# 详情页的四个分页，(键, 按钮文字)
+_PAGE_TABS: Tuple[Tuple[str, str], ...] = (
+    ("watched", "监控中"),
+    ("removed", "已删除"),
+    ("blacklist", "黑名单"),
+    ("detail", "最近命中"),
+)
+_DEFAULT_TAB = _PAGE_TABS[0][0]
 # 一次性扫描任务的稳定标识
 _ONCE_JOB_ID = "watch_once"
 # 远程命令的动作标识，同时用于命令声明与事件判定
@@ -100,9 +113,9 @@ class DownloadWatch(_PluginBase):
     """
 
     plugin_name = "下载监控"
-    plugin_desc = "定时扫描下载任务，等待超过设定时长且进度仍低于阈值的任务自动删除，并把种子拉黑避免重复下载。"
+    plugin_desc = "定时扫描正在下载的任务，等待超过设定时长且进度仍低于阈值的自动删除，并把种子拉黑避免重复下载。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_label = "下载,清理"
     plugin_author = "kongchengll"
     plugin_config_prefix = "downloadwatch_"
@@ -121,6 +134,8 @@ class DownloadWatch(_PluginBase):
         self._last_scan: Dict[str, Any] = {}
         # 详情页展示用的监控中与已删除记录
         self._records: Dict[str, List[Dict[str, Any]]] = {"watched": [], "removed": []}
+        # 详情页当前选中的分页
+        self._page_tab = _DEFAULT_TAB
 
     def init_plugin(self, config: Optional[Dict[str, Any]] = None) -> None:
         """
@@ -133,6 +148,7 @@ class DownloadWatch(_PluginBase):
         self._cron_valid = self._check_cron(self._config.get("cron", ""))
         self._last_scan = self._load_last_scan()
         self._records = self._load_records()
+        self._page_tab = self._validate_tab(self._load_page_tab())
 
         if not self._enabled:
             logger.debug("下载监控：插件未启用")
@@ -223,6 +239,8 @@ class DownloadWatch(_PluginBase):
         dry_run = bool(self._config.get("dry_run"))
 
         alive: set[str] = set()
+        # 处于「正在下载」状态的任务数，用于说明本轮实际参与判定的范围
+        downloading_total = 0
         detail: List[str] = []
         removed = 0
         waiting = 0
@@ -247,6 +265,13 @@ class DownloadWatch(_PluginBase):
             size = format_size(getattr(torrent, "size", 0))
             tags_text = str(getattr(torrent, "tags", "") or "")
             speed = str(getattr(torrent, "dlspeed", "") or "")
+
+            # 只监控正在下载的任务：暂停、已完成、做种中等任务一律跳过，
+            # 同时清掉观察计时，避免任务恢复下载后沿用暂停期间的等待时长
+            if not is_downloading(getattr(torrent, "state", None)):
+                first_seen.pop(torrent_hash, None)
+                continue
+            downloading_total += 1
 
             # 已完成或做种中的任务永不处理，同时清掉观察计时
             if is_finished(progress):
@@ -360,7 +385,9 @@ class DownloadWatch(_PluginBase):
         self._records = records
         self._save_records(records)
 
-        message = self._compose_message(len(torrents), removed, waiting, len(blacklist), dry_run, detail)
+        message = self._compose_message(
+            len(torrents), downloading_total, removed, waiting, len(blacklist), dry_run, detail
+        )
         summary = self._summary(
             success=True,
             message=message,
@@ -596,6 +623,7 @@ class DownloadWatch(_PluginBase):
     @staticmethod
     def _compose_message(
         scanned: int,
+        downloading: int,
         removed: int,
         waiting: int,
         blacklist: int,
@@ -605,7 +633,10 @@ class DownloadWatch(_PluginBase):
         """
         组装通知与页面共用的结论文本。
         """
-        head = f"本轮读取 {scanned} 个任务，清理 {removed} 个，仍在观察 {waiting} 个，黑名单 {blacklist} 条。"
+        head = (
+            f"本轮读取 {scanned} 个任务（正在下载 {downloading} 个），"
+            f"清理 {removed} 个，仍在观察 {waiting} 个，黑名单 {blacklist} 条。"
+        )
         if dry_run:
             head = "【演练模式】" + head + "本次未真正删除任何任务。"
         if not detail:
@@ -713,6 +744,36 @@ class DownloadWatch(_PluginBase):
         except Exception as error:  # noqa: BLE001 - 记录失败不影响扫描结论
             logger.warning(f"下载监控：保存记录失败：{error}")
 
+    @staticmethod
+    def _validate_tab(tab: Any) -> str:
+        """
+        把任意输入收敛到合法分页键。
+        """
+        text = str(tab or "").strip().lower()
+        return text if text in {key for key, _ in _PAGE_TABS} else _DEFAULT_TAB
+
+    def _load_page_tab(self) -> str:
+        """
+        读取详情页上次选中的分页。
+        """
+        try:
+            return self._validate_tab(self.get_data(_PAGE_TAB_KEY))
+        except Exception as error:  # noqa: BLE001 - 读取失败回落到默认分页
+            logger.debug(f"下载监控：读取分页失败：{error}")
+            return _DEFAULT_TAB
+
+    def _save_page_tab(self, tab: str) -> str:
+        """
+        持久化详情页选中的分页。
+        """
+        value = self._validate_tab(tab)
+        self._page_tab = value
+        try:
+            self.save_data(_PAGE_TAB_KEY, value)
+        except Exception as error:  # noqa: BLE001 - 保存失败不影响本次切换
+            logger.warning(f"下载监控：保存分页失败：{error}")
+        return value
+
     # ------------------------------------------------------------------
     # 命令与接口
     # ------------------------------------------------------------------
@@ -784,7 +845,23 @@ class DownloadWatch(_PluginBase):
                 "response_model": schemas.Response[StatusData],
                 "summary": "查询下载监控运行状态",
             },
+            {
+                "path": "/tab",
+                "endpoint": self.api_tab,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "切换详情页列表",
+            },
         ]
+
+    def api_tab(self, tab: str = _DEFAULT_TAB) -> Dict[str, Any]:
+        """
+        记录详情页当前选中的分页，页面随后由前端重新拉取。
+
+        :param tab: 分页键，watched / removed / blacklist / detail
+        :return: 切换结果
+        """
+        return {"success": True, "message": self._save_page_tab(tab)}
 
     def api_scan_now(self) -> "schemas.Response[ScanResultData]":
         """
@@ -1007,29 +1084,23 @@ class DownloadWatch(_PluginBase):
 
     def get_page(self) -> List[dict]:
         """
-        返回详情页：运行配置、计数卡片，以及监控中与已删除的任务列表。
+        返回详情页：顶部四个等宽按钮分页，下方只渲染当前分页的列表。
         """
         state = self._load_state()
         records = self._records or self._load_records()
         last_scan = self._last_scan or self._load_last_scan()
-        tags = split_tags(self._config.get("tags"))
+        blacklist = list(state.get("blacklist") or [])
         watched_rows = list(records.get("watched") or [])
         removed_rows = list(records.get("removed") or [])
-        notify_state = "关" if not self._config.get("notify") else (
-            "监控/删除"
-            if self._config.get("notify_watch") and self._config.get("notify_remove")
-            else ("仅监控" if self._config.get("notify_watch") else ("仅删除" if self._config.get("notify_remove") else "关"))
-        )
-        status_text = (
-            f"插件状态：{'已启用' if self._enabled else '未启用'}\n"
-            f"判定条件：等待 ≥ {self._config.get('max_hours')} 小时 且 进度 ≤ {self._config.get('min_progress')}%\n"
-            f"监控标签：{'、'.join(tags) if tags else '全部任务'}\n"
-            f"扫描周期：{self._config.get('cron')}\n"
-            f"删除文件：{'是' if self._config.get('delete_files') else '否'}　"
-            f"演练模式：{'是' if self._config.get('dry_run') else '否'}　"
-            f"拉黑：{'是' if self._config.get('use_blacklist') else '否'}　"
-            f"通知：{notify_state}"
-        )
+        detail = list(last_scan.get("detail") or [])
+        counts = {
+            "watched": len(watched_rows),
+            "removed": len(removed_rows),
+            "blacklist": len(blacklist),
+            "detail": len(detail),
+        }
+        active = self._validate_tab(self._page_tab)
+
         page: List[dict] = [
             {
                 "component": "VAlert",
@@ -1037,125 +1108,50 @@ class DownloadWatch(_PluginBase):
                     "type": "info",
                     "variant": "tonal",
                     "title": "运行配置",
-                    "text": status_text,
+                    "text": self._status_text(last_scan),
                 },
             },
             {
                 "component": "VRow",
+                "props": {"class": "mt-1"},
                 "content": [
-                    self._col(3, [self._stat_card("最近扫描", str(last_scan.get("time") or "尚未扫描"), "success")]),
-                    self._col(3, [self._stat_card("监控中", f"{len(watched_rows)} 个任务正在计时", "info")]),
-                    self._col(3, [self._stat_card("已删除", f"累计 {len(removed_rows)} 条记录", "warning")]),
-                    self._col(
-                        3,
-                        [
-                            self._stat_card(
-                                "黑名单",
-                                f"{len(state['blacklist'])} 条种子，再次出现会被立即清理",
-                                "error",
-                            )
-                        ],
-                    ),
+                    self._tab_column(key, label, counts.get(key, 0), key == active)
+                    for key, label in _PAGE_TABS
                 ],
             },
         ]
 
-        if watched_rows:
-            page.append(
-                {
-                    "component": "h3",
-                    "props": {"class": "mt-6 mb-2"},
-                    "text": "监控中的任务",
-                }
-            )
-            page.append(
-                {
-                    "component": "VDataTable",
-                    "props": {
-                        "density": "compact",
-                        "items-per-page": 10,
-                        "headers": [
-                            {"title": "标题", "key": "title"},
-                            {"title": "进度", "key": "progress"},
-                            {"title": "已等待", "key": "wait"},
-                            {"title": "大小", "key": "size"},
-                            {"title": "速度", "key": "speed"},
-                            {"title": "标签", "key": "tags"},
-                            {"title": "首见时间", "key": "since"},
-                        ],
-                        "items": watched_rows,
-                    },
-                }
-            )
+        rows, empty_text, empty_kind = self._tab_content(
+            active, watched_rows, removed_rows, blacklist, detail
+        )
+        if rows:
+            page.extend(rows)
+            total = counts.get(active, 0)
+            if total > len(rows):
+                page.append(
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "text",
+                            "density": "compact",
+                            "text": f"仅显示前 {len(rows)} 条，共 {total} 条。",
+                        },
+                    }
+                )
         else:
             page.append(
                 {
                     "component": "VAlert",
                     "props": {
-                        "type": "info",
+                        "type": empty_kind,
                         "variant": "tonal",
-                        "title": "监控中",
-                        "text": "当前没有处于监控中的下载任务。"
-                                "插件只监控未完成、且标签命中的任务；已完成或做种中的任务不会出现在这里。",
+                        "title": "暂无数据",
+                        "text": empty_text,
                     },
                 }
             )
 
-        if removed_rows:
-            page.append(
-                {
-                    "component": "h3",
-                    "props": {"class": "mt-6 mb-2"},
-                    "text": "已删除的任务",
-                }
-            )
-            page.append(
-                {
-                    "component": "VDataTable",
-                    "props": {
-                        "density": "compact",
-                        "items-per-page": 10,
-                        "headers": [
-                            {"title": "删除时间", "key": "time"},
-                            {"title": "标题", "key": "title"},
-                            {"title": "进度", "key": "progress"},
-                            {"title": "已等待", "key": "wait"},
-                            {"title": "原因", "key": "reason"},
-                            {"title": "文件", "key": "files"},
-                            {"title": "订阅处理", "key": "note"},
-                        ],
-                        "items": list(reversed(removed_rows)),
-                    },
-                }
-            )
-        else:
-            page.append(
-                {
-                    "component": "VAlert",
-                    "props": {
-                        "type": "info",
-                        "variant": "tonal",
-                        "title": "已删除",
-                        "text": "还没有删除过任务。开启演练模式跑一轮，可以先在「最近命中」里确认会被删掉的任务。",
-                    },
-                }
-            )
-
-        detail = list(last_scan.get("detail") or [])
-        if detail:
-            dry_run = bool(self._config.get("dry_run"))
-            page.append(
-                {
-                    "component": "VAlert",
-                    "props": {
-                        "type": "warning",
-                        "variant": "tonal",
-                        "title": "最近一次扫描命中明细"
-                                + ("（演练模式，未真正删除）" if dry_run else ""),
-                        "text": "\n".join(str(item) for item in detail[-MAX_NOTIFY_LINES:]),
-                    },
-                }
-            )
         if not self._enabled:
             page.append(
                 {
@@ -1170,20 +1166,199 @@ class DownloadWatch(_PluginBase):
             )
         return page
 
-    @staticmethod
-    def _stat_card(title: str, text: str, kind: str = "info") -> dict:
+    def _tab_content(
+        self,
+        tab: str,
+        watched_rows: List[Dict[str, Any]],
+        removed_rows: List[Dict[str, Any]],
+        blacklist: List[Dict[str, Any]],
+        detail: List[Any],
+    ) -> Tuple[List[dict], str, str]:
         """
-        生成详情页顶部的一枚计数卡片。
+        按当前分页生成列表元素。
+
+        :return: (列表元素, 空数据说明, 空数据提示类型)
         """
-        return {
-            "component": "VAlert",
-            "props": {
-                "type": kind,
-                "variant": "tonal",
-                "title": title,
-                "text": text,
-            },
+        if tab == "watched":
+            rows = [
+                self._item(
+                    str(item.get("title") or "未知任务"),
+                    self._watched_meta(item),
+                    "info",
+                )
+                for item in watched_rows[-MAX_LIST_ROWS:]
+            ]
+            return (
+                rows,
+                "当前没有正在下载的任务。插件只监控状态为「下载中」且标签命中的任务，"
+                "暂停、已完成和做种中的任务不会出现在这里。",
+                "info",
+            )
+        if tab == "removed":
+            # 最新的排在最上面
+            rows = [
+                self._item(
+                    str(item.get("title") or "未知任务"),
+                    self._removed_meta(item),
+                    "warning",
+                )
+                for item in list(reversed(removed_rows))[:MAX_LIST_ROWS]
+            ]
+            return (
+                rows,
+                "还没有删除过任务。可以开启演练模式跑一轮，先在「最近命中」里确认会被删掉的任务。",
+                "info",
+            )
+        if tab == "blacklist":
+            rows = [
+                self._item(
+                    str(item.get("title") or "未知种子"),
+                    self._blacklist_meta(item),
+                    "error",
+                )
+                for item in list(reversed(blacklist))[:MAX_LIST_ROWS]
+            ]
+            return (
+                rows,
+                "黑名单为空。删除过任务并开启「删除后拉黑」后，被删的种子会记录在这里。",
+                "info",
+            )
+        dry_run = bool(self._config.get("dry_run"))
+        rows = [
+            self._item(str(line), "", "warning")
+            for line in list(reversed(detail))[:MAX_LIST_ROWS]
+        ]
+        return (
+            rows,
+            "最近一次扫描没有命中任何任务。"
+            + ("当前处于演练模式，命中的任务只记录不删除。" if dry_run else ""),
+            "info",
+        )
+
+    def _status_text(self, last_scan: Dict[str, Any]) -> str:
+        """
+        生成顶部运行配置说明。
+        """
+        tags = split_tags(self._config.get("tags"))
+        notify_state = "关" if not self._config.get("notify") else (
+            "监控/删除"
+            if self._config.get("notify_watch") and self._config.get("notify_remove")
+            else ("仅监控" if self._config.get("notify_watch")
+                  else ("仅删除" if self._config.get("notify_remove") else "关"))
+        )
+        return (
+            f"插件状态：{'已启用' if self._enabled else '未启用'}　"
+            f"最近扫描：{last_scan.get('time') or '尚未扫描'}\n"
+            f"判定条件：正在下载，且已等待 ≥ {self._config.get('max_hours')} 小时、"
+            f"进度 ≤ {self._config.get('min_progress')}%\n"
+            f"监控标签：{'、'.join(tags) if tags else '全部任务'}　"
+            f"扫描周期：{self._config.get('cron')}\n"
+            f"删除文件：{'是' if self._config.get('delete_files') else '否'}　"
+            f"演练模式：{'是' if self._config.get('dry_run') else '否'}　"
+            f"拉黑：{'是' if self._config.get('use_blacklist') else '否'}　"
+            f"通知：{notify_state}"
+        )
+
+    def _tab_column(self, key: str, label: str, count: int, active: bool) -> dict:
+        """
+        生成一个分页按钮，四个按钮等宽等高，仅选中项高亮。
+        """
+        props: Dict[str, Any] = {
+            "block": True,
+            "height": 64,
+            "class": "text-none",
+            "variant": "flat" if active else "outlined",
         }
+        if active:
+            props["color"] = "primary"
+        return self._col(
+            3,
+            [
+                {
+                    "component": "VBtn",
+                    "props": props,
+                    "events": {
+                        "click": {
+                            "api": f"/plugin/{self.__class__.__name__}/tab",
+                            "method": "get",
+                            "params": {"tab": key},
+                        }
+                    },
+                    "content": [
+                        {"component": "span", "props": {"class": "text-body-2"}, "text": label},
+                        {
+                            "component": "span",
+                            "props": {"class": "text-h6 font-weight-bold ms-2"},
+                            "text": str(count),
+                        },
+                    ],
+                }
+            ],
+        )
+
+    @staticmethod
+    def _item(title: str, meta: str, kind: str = "info") -> dict:
+        """
+        生成列表中的一条记录，标题一行、明细一行。
+        """
+        props: Dict[str, Any] = {
+            "type": kind,
+            "variant": "tonal",
+            "density": "compact",
+            "class": "mb-1",
+            "title": title,
+        }
+        if meta:
+            props["text"] = meta
+        return {"component": "VAlert", "props": props}
+
+    @staticmethod
+    def _watched_meta(row: Dict[str, Any]) -> str:
+        """
+        监控中任务的明细行。
+        """
+        return " · ".join(
+            [
+                f"进度 {row.get('progress') or '0.0%'}",
+                f"已等待 {row.get('wait') or '—'}",
+                f"大小 {row.get('size') or '未知'}",
+                f"速度 {row.get('speed') or '—'}",
+                f"标签 {row.get('tags') or '—'}",
+                f"首见 {row.get('since') or '—'}",
+            ]
+        )
+
+    @staticmethod
+    def _removed_meta(row: Dict[str, Any]) -> str:
+        """
+        已删除任务的明细行。
+        """
+        parts = [
+            str(row.get("time") or "—"),
+            f"进度 {row.get('progress') or '—'}",
+            f"已等待 {row.get('wait') or '—'}",
+            f"原因 {row.get('reason') or '—'}",
+            f"文件{row.get('files') or '—'}",
+        ]
+        note = str(row.get("note") or "").strip()
+        if note and note != "—":
+            parts.append(note)
+        return " · ".join(parts)
+
+    @staticmethod
+    def _blacklist_meta(item: Dict[str, Any]) -> str:
+        """
+        黑名单条目的明细行。
+        """
+        reason = reason_text(str(item.get("reason") or ""))
+        return " · ".join(
+            [
+                str(item.get("removed_at") or "—"),
+                reason,
+                f"hash {str(item.get('hash') or '')[:12]}",
+            ]
+        )
+
 
     def stop_service(self) -> None:
         """

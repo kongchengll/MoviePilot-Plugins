@@ -24,6 +24,9 @@ MAX_WATCH_RECORDS = 200
 # 单轮通知里最多列举的条目数，超出部分只给数量
 MAX_NOTIFY_LINES = 10
 
+# 详情页单个列表最多渲染的条目数，避免任务很多时页面 JSON 过大
+MAX_LIST_ROWS = 50
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": False,
     "cron": DEFAULT_CRON,

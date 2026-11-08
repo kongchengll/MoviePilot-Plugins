@@ -27,6 +27,7 @@ from app.plugins.downloadwatch.monitor import (
     evaluate,
     format_duration,
     format_size,
+    is_downloading,
     is_finished,
     progress_text,
     reason_text,
@@ -310,3 +311,30 @@ def test_notify_switches_default_on():
     config = normalize_config({"notify_watch": "0", "notify_remove": "true"})
     assert config["notify_watch"] is False
     assert config["notify_remove"] is True
+
+
+def test_is_downloading_accepts_only_running_tasks():
+    """
+    只把宿主归一后的 downloading 视为正在下载；暂停与已完成任务不参与监控。
+    """
+    assert is_downloading("downloading") is True
+    assert is_downloading(" Downloading ") is True
+    # 老版本投影可能不给 state，按正在下载兜底
+    assert is_downloading(None) is True
+    assert is_downloading("") is True
+    assert is_downloading("paused") is False
+    assert is_downloading("completed") is False
+
+
+def test_validate_tab_falls_back_to_default():
+    """
+    分页键只接受四个合法值，非法输入回落到「监控中」，避免持久化脏数据。
+    """
+    from app.plugins.downloadwatch import DownloadWatch
+
+    assert DownloadWatch._validate_tab("watched") == "watched"
+    assert DownloadWatch._validate_tab(" REMOVED ") == "removed"
+    assert DownloadWatch._validate_tab("blacklist") == "blacklist"
+    assert DownloadWatch._validate_tab("detail") == "detail"
+    assert DownloadWatch._validate_tab("../../etc/passwd") == "watched"
+    assert DownloadWatch._validate_tab(None) == "watched"

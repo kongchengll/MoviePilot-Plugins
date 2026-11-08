@@ -21,6 +21,11 @@ REASON_REAP = "reap"
 # 命中本地黑名单
 REASON_BLACKLIST = "blacklist"
 
+# 宿主归一后的任务状态取值
+STATE_DOWNLOADING = "downloading"
+STATE_PAUSED = "paused"
+STATE_COMPLETED = "completed"
+
 
 @dataclass(frozen=True)
 class Decision:
@@ -47,6 +52,19 @@ def is_finished(progress: Optional[float]) -> bool:
         return False
     # 下载器偶尔会报 99.99x，按已完成处理，避免卡在最后一刻被误删
     return value >= 99.9
+
+
+def is_downloading(state: Optional[str]) -> bool:
+    """
+    判断任务是否处于「正在下载」状态。
+
+    宿主已把各下载器的原始状态归一成 downloading / paused / completed 三种；
+    任务对象缺省 state 时按 downloading 处理，兼容老版本投影。
+
+    :param state: 宿主归一后的任务状态
+    """
+    text = str(state or "").strip().lower()
+    return not text or text == STATE_DOWNLOADING
 
 
 def evaluate(
