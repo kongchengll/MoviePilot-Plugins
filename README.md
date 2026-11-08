@@ -18,3 +18,14 @@ MoviePilot官方插件市场：https://github.com/jxxghp/MoviePilot-Plugins
   排除关键词；也可在消息渠道发送 `/digest_push` 随时手动触发一次。
 
   详见 [插件说明](plugins.v3/dailyepisodedigest/README.md)。
+
+### [下载监控](https://github.com/kongchengll/MoviePilot-Plugins/tree/main/plugins.v3/downloadwatch)
+  > MoviePilot V3 插件
+
+  定时扫描下载任务，把「等待 ≥ X 小时且进度 ≤ Y%」的任务判定为卡死并删除，
+  支持按下载器标签筛选、演练模式、删除时是否连文件一起删。
+
+  删除后种子会进入本地黑名单，再次被订阅下载时当轮清理；也可以选择把种子标题
+  追加进对应订阅的排除规则，从源头阻止重复下载。
+
+  详见 [插件说明](plugins.v3/downloadwatch/README.md)。
