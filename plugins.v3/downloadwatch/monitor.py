@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional, Sequence
 
 # 任务已下载完成（含做种中），任何情况下都不处理
 REASON_FINISHED = "finished"
@@ -114,3 +114,114 @@ def progress_text(progress: Optional[float]) -> str:
     except (TypeError, ValueError):
         value = 0.0
     return f"{max(0.0, min(100.0, value)):.1f}%"
+
+
+def format_size(size: Optional[float]) -> str:
+    """
+    把字节数格式化为便于阅读的容量文本。
+
+    :param size: 文件大小，单位为字节
+    :return: 如 `860 B`、`1.4 GB`；取值不可用时返回 `未知`
+    """
+    try:
+        value = float(size or 0)
+    except (TypeError, ValueError):
+        return "未知"
+    if value <= 0:
+        return "未知"
+    units = ("B", "KB", "MB", "GB", "TB")
+    index = 0
+    while value >= 1024 and index < len(units) - 1:
+        value /= 1024
+        index += 1
+    if index == 0:
+        return f"{int(value)} B"
+    return f"{value:.1f} {units[index]}"
+
+
+def reason_text(reason: str) -> str:
+    """
+    把判定原因转换成人能看懂的短语，供通知与页面使用。
+    """
+    if reason == REASON_REAP:
+        return "超时且进度停滞"
+    if reason == REASON_BLACKLIST:
+        return "命中黑名单"
+    if reason == REASON_FINISHED:
+        return "已完成"
+    if reason == REASON_PROGRESSING:
+        return "进度正常"
+    return "观察中"
+
+
+@dataclass(frozen=True)
+class NotifyDraft:
+    """
+    一条待发送的通知。
+
+    :param title: 通知标题
+    :param text: 通知正文
+    """
+
+    title: str
+    text: str
+
+
+def compose_notify(
+    *,
+    watched: Sequence[str],
+    removed: Sequence[str],
+    watched_total: int,
+    blacklist_total: int,
+    delete_files: bool,
+    limit: int = 10,
+) -> Optional[NotifyDraft]:
+    """
+    组装「新增监控 + 已删除」通知。
+
+    两类事件合并进同一条消息，避免一次扫描发两条通知；只有开关打开且确实有
+    对应事件时才产出条目。正文按段列举，单段最多 ``limit`` 行。
+
+    :param watched: 本轮新进入监控的任务描述
+    :param removed: 本轮删除的任务描述
+    :param watched_total: 当前仍在监控中的任务总数
+    :param blacklist_total: 当前黑名单条目数
+    :param delete_files: 是否连文件一起删除，用于说明删除口径
+    :param limit: 每段最多列举的行数
+    :return: 待发送通知；没有可发送内容时返回 None
+    """
+    watched_lines: List[str] = [str(item) for item in watched if str(item).strip()]
+    removed_lines: List[str] = [str(item) for item in removed if str(item).strip()]
+    if not watched_lines and not removed_lines:
+        return None
+
+    titles: List[str] = []
+    if removed_lines:
+        titles.append(f"删除 {len(removed_lines)} 个任务")
+    if watched_lines:
+        titles.append(f"新增监控 {len(watched_lines)} 个任务")
+    title = "下载监控：" + "｜".join(titles)
+
+    lines: List[str] = []
+    if removed_lines:
+        lines.append(f"【已删除】{len(removed_lines)} 个任务（删除文件：{'是' if delete_files else '否'}）")
+        lines.extend(_bullets(removed_lines, limit))
+    if watched_lines:
+        if lines:
+            lines.append("")
+        lines.append(f"【新增监控】{len(watched_lines)} 个任务")
+        lines.extend(_bullets(watched_lines, limit))
+    lines.append("")
+    lines.append(f"当前监控中 {max(0, int(watched_total))} 个任务，黑名单 {max(0, int(blacklist_total))} 条。")
+    return NotifyDraft(title=title, text="\n".join(lines))
+
+
+def _bullets(lines: Sequence[str], limit: int) -> List[str]:
+    """
+    把条目渲染成列表行，超出上限的部分只给数量。
+    """
+    maximum = max(1, int(limit))
+    rendered = [f"· {line}" for line in lines[:maximum]]
+    if len(lines) > maximum:
+        rendered.append(f"· 其余 {len(lines) - maximum} 条已省略")
+    return rendered

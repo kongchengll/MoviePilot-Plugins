@@ -28,4 +28,7 @@ MoviePilot官方插件市场：https://github.com/jxxghp/MoviePilot-Plugins
   删除后种子会进入本地黑名单，再次被订阅下载时当轮清理；也可以选择把种子标题
   追加进对应订阅的排除规则，从源头阻止重复下载。
 
+  任务进入监控与被删除时均可推送通知，插件详情页可直接查看「监控中」与「已删除」
+  的任务列表。
+
   详见 [插件说明](plugins.v3/downloadwatch/README.md)。

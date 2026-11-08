@@ -5,6 +5,7 @@
 卡死，删除任务（可选连文件一起删），并把该种子记入本地黑名单；黑名单里的种子
 再次被订阅下载时会被立即清理，从而避免同一个坏种子反复占用下载位。
 可选地把种子标题追加进对应订阅的排除规则，从源头阻止重复下载。
+详情页展示监控中与已删除的任务列表，任务进入监控与被删除时均可推送通知。
 """
 
 from __future__ import annotations
@@ -29,6 +30,8 @@ from .config import (
     DEFAULT_CONFIG,
     MAX_BLACKLIST,
     MAX_NOTIFY_LINES,
+    MAX_REMOVED_RECORDS,
+    MAX_WATCH_RECORDS,
     merge_exclude,
     normalize_config,
     normalize_title,
@@ -38,14 +41,19 @@ from .config import (
 )
 from .monitor import (
     REASON_BLACKLIST,
+    compose_notify,
     evaluate,
     format_duration,
+    format_size,
     is_finished,
     progress_text,
+    reason_text,
 )
 
 # 观察状态与黑名单的持久化键
 _STATE_KEY = "watch_state"
+# 详情页展示用的监控中/已删除记录
+_RECORDS_KEY = "watch_records"
 # 最近一次扫描结果的持久化键，供详情页在实例重建后仍能展示
 _LAST_SCAN_KEY = "last_scan"
 # 一次性扫描任务的稳定标识
@@ -80,6 +88,8 @@ class StatusData(BaseModel):
     min_progress: int = Field(default=0, description="进度阈值（百分比）")
     tags: List[str] = Field(default_factory=list, description="监控标签")
     blacklist: int = Field(default=0, description="黑名单条目数")
+    watched: int = Field(default=0, description="当前监控中的任务数")
+    removed: int = Field(default=0, description="已删除记录条数")
     last_scan: Optional[str] = Field(default=None, description="最近一次扫描时间")
     last_message: Optional[str] = Field(default=None, description="最近一次扫描结论")
 
@@ -92,7 +102,7 @@ class DownloadWatch(_PluginBase):
     plugin_name = "下载监控"
     plugin_desc = "定时扫描下载任务，等待超过设定时长且进度仍低于阈值的任务自动删除，并把种子拉黑避免重复下载。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_label = "下载,清理"
     plugin_author = "kongchengll"
     plugin_config_prefix = "downloadwatch_"
@@ -109,6 +119,8 @@ class DownloadWatch(_PluginBase):
         self._cron_valid = True
         # 当前实例内的最近一次扫描结论，落盘后仍可恢复
         self._last_scan: Dict[str, Any] = {}
+        # 详情页展示用的监控中与已删除记录
+        self._records: Dict[str, List[Dict[str, Any]]] = {"watched": [], "removed": []}
 
     def init_plugin(self, config: Optional[Dict[str, Any]] = None) -> None:
         """
@@ -120,6 +132,7 @@ class DownloadWatch(_PluginBase):
         self._enabled = bool(self._config.get("enabled"))
         self._cron_valid = self._check_cron(self._config.get("cron", ""))
         self._last_scan = self._load_last_scan()
+        self._records = self._load_records()
 
         if not self._enabled:
             logger.debug("下载监控：插件未启用")
@@ -213,6 +226,13 @@ class DownloadWatch(_PluginBase):
         detail: List[str] = []
         removed = 0
         waiting = 0
+        # 本轮新进入监控的任务描述，以及详情页用的监控中快照
+        watch_events: List[str] = []
+        watch_rows: List[Dict[str, Any]] = []
+        # 本轮删除的任务描述，供通知与详情页使用
+        remove_events: List[str] = []
+        remove_rows: List[Dict[str, Any]] = []
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         for torrent in torrents:
             torrent_hash = str(getattr(torrent, "hash", "") or "").strip().lower()
@@ -223,6 +243,10 @@ class DownloadWatch(_PluginBase):
             title = normalize_title(getattr(torrent, "title", "") or getattr(torrent, "name", ""))
             title = title or torrent_hash
             progress = getattr(torrent, "progress", 0)
+            downloader = str(getattr(torrent, "downloader", "") or "")
+            size = format_size(getattr(torrent, "size", 0))
+            tags_text = str(getattr(torrent, "tags", "") or "")
+            speed = str(getattr(torrent, "dlspeed", "") or "")
 
             # 已完成或做种中的任务永不处理，同时清掉观察计时
             if is_finished(progress):
@@ -230,6 +254,7 @@ class DownloadWatch(_PluginBase):
                 continue
 
             record = first_seen.get(torrent_hash)
+            is_new = record is None
             age_seconds: Optional[int] = None
             if record:
                 try:
@@ -242,13 +267,13 @@ class DownloadWatch(_PluginBase):
                 first_seen[torrent_hash] = {
                     "ts": now,
                     "title": title,
-                    "downloader": str(getattr(torrent, "downloader", "") or ""),
+                    "downloader": downloader,
                 }
 
             if use_blacklist and torrent_hash in black_hashes:
                 reason = REASON_BLACKLIST
             else:
-                if not tags_match(getattr(torrent, "tags", ""), wanted_tags):
+                if not tags_match(tags_text, wanted_tags):
                     # 标签不匹配的任务不参与判定，但保留观察计时
                     continue
                 decision = evaluate(
@@ -258,8 +283,22 @@ class DownloadWatch(_PluginBase):
                     min_progress=min_progress,
                 )
                 if not decision.reap:
-                    if age_seconds is not None:
-                        waiting += 1
+                    watch_rows.append(
+                        self._watch_row(
+                            title=title,
+                            progress=progress,
+                            age_seconds=age_seconds,
+                            size=size,
+                            tags=tags_text,
+                            downloader=downloader,
+                            speed=speed,
+                            first_ts=record.get("ts") if record else now,
+                        )
+                    )
+                    if is_new:
+                        watch_events.append(
+                            self._describe(torrent, title, progress, age_seconds, decision.reason)
+                        )
                     continue
                 reason = decision.reason
 
@@ -278,8 +317,8 @@ class DownloadWatch(_PluginBase):
                     {
                         "hash": torrent_hash,
                         "title": title,
-                        "downloader": str(getattr(torrent, "downloader", "") or ""),
-                        "removed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "downloader": downloader,
+                        "removed_at": stamp,
                         "reason": reason,
                     }
                 )
@@ -289,12 +328,37 @@ class DownloadWatch(_PluginBase):
             if self._config.get("sync_subscribe"):
                 note = self._sync_subscribe_exclude(torrent, title)
             detail.append(f"{label}{'｜' + note if note else ''}")
+            remove_events.append(label)
+            remove_rows.append(
+                self._remove_row(
+                    title=title,
+                    progress=progress,
+                    age_seconds=age_seconds,
+                    reason=reason,
+                    size=size,
+                    downloader=downloader,
+                    delete_files=delete_files,
+                    removed_at=stamp,
+                    note=note,
+                )
+            )
 
         # 只保留仍然存在的任务，避免长期运行后观察表无限增长
         first_seen = {key: value for key, value in first_seen.items() if key in alive}
         if len(blacklist) > MAX_BLACKLIST:
             blacklist = blacklist[-MAX_BLACKLIST:]
+        # 「仍在观察」与详情页表格口径保持一致：标签命中的未完成任务
+        waiting = len(watch_rows)
         self._save_state({"first_seen": first_seen, "blacklist": blacklist})
+
+        # 监控中快照按本轮结果整体替换；已删除记录按时间累积，超上限裁掉最旧的
+        previous_removed = self._records.get("removed") or []
+        records = {
+            "watched": watch_rows[-MAX_WATCH_RECORDS:],
+            "removed": (previous_removed + remove_rows)[-MAX_REMOVED_RECORDS:],
+        }
+        self._records = records
+        self._save_records(records)
 
         message = self._compose_message(len(torrents), removed, waiting, len(blacklist), dry_run, detail)
         summary = self._summary(
@@ -306,19 +370,127 @@ class DownloadWatch(_PluginBase):
             blacklist=len(blacklist),
             dry_run=dry_run,
             detail=detail[:MAX_NOTIFY_LINES],
+            watched=len(watch_rows),
+            watched_new=len(watch_events),
+            removed_list=len(records["removed"]),
         )
         self._remember_scan(summary)
 
-        should_notify = self._config.get("notify") if notify is None else notify
-        if should_notify and detail:
-            self.post_message(
-                mtype=_MESSAGE_TYPE,
-                title="下载监控：已清理卡死任务" if removed else "下载监控：演练结果",
-                text=message,
-            )
-        elif should_notify and removed:
-            self.post_message(mtype=_MESSAGE_TYPE, title="下载监控", text=message)
+        self._notify_scan(
+            notify=notify,
+            watch_events=watch_events,
+            remove_events=remove_events,
+            watched_total=len(watch_rows),
+            blacklist_total=len(blacklist),
+            delete_files=delete_files,
+            dry_run=dry_run,
+        )
         return summary
+
+    def _notify_scan(
+        self,
+        *,
+        notify: Optional[bool],
+        watch_events: List[str],
+        remove_events: List[str],
+        watched_total: int,
+        blacklist_total: int,
+        delete_files: bool,
+        dry_run: bool,
+    ) -> None:
+        """
+        按开关发送「新增监控 + 已删除」通知。
+
+        两类事件合并成一条消息，避免一次扫描刷两条通知；演练模式下删除事件
+        不会产生，因此只会看到新增监控。
+
+        :param notify: 调用方指定的通知开关；None 表示沿用配置
+        :param watch_events: 本轮新进入监控的任务描述
+        :param remove_events: 本轮实际删除的任务描述
+        :param watched_total: 当前监控中任务数
+        :param blacklist_total: 黑名单条目数
+        :param delete_files: 删除任务时是否连文件一起删
+        :param dry_run: 是否处于演练模式
+        """
+        if notify is None:
+            if not self._config.get("notify"):
+                return
+            notify = True
+        if not notify:
+            return
+
+        watched = watch_events if self._config.get("notify_watch") else []
+        removed = remove_events if self._config.get("notify_remove") else []
+        draft = compose_notify(
+            watched=watched,
+            removed=removed,
+            watched_total=watched_total,
+            blacklist_total=blacklist_total,
+            delete_files=delete_files,
+            limit=MAX_NOTIFY_LINES,
+        )
+        if draft is None:
+            return
+        title = f"【演练】{draft.title}" if dry_run and not removed else draft.title
+        self.post_message(mtype=_MESSAGE_TYPE, title=title, text=draft.text)
+
+    @staticmethod
+    def _watch_row(
+        *,
+        title: str,
+        progress: Any,
+        age_seconds: Optional[int],
+        size: str,
+        tags: str,
+        downloader: str,
+        speed: str,
+        first_ts: Any,
+    ) -> Dict[str, Any]:
+        """
+        生成详情页「监控中」表格的一行。
+        """
+        try:
+            first_text = datetime.fromtimestamp(int(first_ts)).strftime("%m-%d %H:%M")
+        except (TypeError, ValueError, OSError):
+            first_text = "—"
+        return {
+            "title": title,
+            "progress": progress_text(progress),
+            "wait": format_duration(age_seconds) if age_seconds is not None else "刚开始",
+            "size": size,
+            "speed": speed or "—",
+            "tags": tags or "—",
+            "downloader": downloader or "—",
+            "since": first_text,
+        }
+
+    @staticmethod
+    def _remove_row(
+        *,
+        title: str,
+        progress: Any,
+        age_seconds: Optional[int],
+        reason: str,
+        size: str,
+        downloader: str,
+        delete_files: bool,
+        removed_at: str,
+        note: str,
+    ) -> Dict[str, Any]:
+        """
+        生成详情页「已删除」表格的一行。
+        """
+        return {
+            "time": removed_at,
+            "title": title,
+            "progress": progress_text(progress),
+            "wait": format_duration(age_seconds) if age_seconds is not None else "—",
+            "size": size,
+            "reason": reason_text(reason),
+            "downloader": downloader or "—",
+            "files": "已删除" if delete_files else "保留",
+            "note": note or "—",
+        }
 
     def _remove(
         self,
@@ -515,6 +687,32 @@ class DownloadWatch(_PluginBase):
         except Exception as error:  # noqa: BLE001 - 保存失败只记录，避免影响删除结果
             logger.warning(f"下载监控：保存运行状态失败：{error}")
 
+    def _load_records(self) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        读取详情页展示用的监控中与已删除记录。
+        """
+        try:
+            raw = self.get_data(_RECORDS_KEY)
+        except Exception as error:  # noqa: BLE001 - 数据缺失按空记录处理
+            logger.debug(f"下载监控：读取记录失败：{error}")
+            raw = None
+        data = raw if isinstance(raw, dict) else {}
+        return {
+            "watched": [item for item in data.get("watched") or [] if isinstance(item, dict)]
+            if isinstance(data.get("watched"), list) else [],
+            "removed": [item for item in data.get("removed") or [] if isinstance(item, dict)]
+            if isinstance(data.get("removed"), list) else [],
+        }
+
+    def _save_records(self, records: Dict[str, Any]) -> None:
+        """
+        持久化详情页展示用的记录。
+        """
+        try:
+            self.save_data(_RECORDS_KEY, records)
+        except Exception as error:  # noqa: BLE001 - 记录失败不影响扫描结论
+            logger.warning(f"下载监控：保存记录失败：{error}")
+
     # ------------------------------------------------------------------
     # 命令与接口
     # ------------------------------------------------------------------
@@ -558,6 +756,7 @@ class DownloadWatch(_PluginBase):
         text = (
             f"插件状态：{'已启用' if status and status.enabled else '未启用'}\n"
             f"判定条件：等待 ≥ {status.max_hours if status else 0} 小时且进度 ≤ {status.min_progress if status else 0}%\n"
+            f"监控中：{status.watched if status else 0} 个　已删除：{status.removed if status else 0} 条\n"
             f"黑名单：{status.blacklist if status else 0} 条\n"
             f"最近扫描：{status.last_scan if status and status.last_scan else '尚未扫描'}\n"
             f"最近结论：{status.last_message if status and status.last_message else '无'}"
@@ -614,6 +813,7 @@ class DownloadWatch(_PluginBase):
         :return: 宿主统一响应结构
         """
         state = self._load_state()
+        records = self._records or self._load_records()
         last_scan = self._last_scan or self._load_last_scan()
         return schemas.Response(
             success=True,
@@ -624,6 +824,8 @@ class DownloadWatch(_PluginBase):
                 min_progress=int(self._config.get("min_progress") or 0),
                 tags=split_tags(self._config.get("tags")),
                 blacklist=len(state["blacklist"]),
+                watched=len(records.get("watched") or []),
+                removed=len(records.get("removed") or []),
                 last_scan=str(last_scan.get("time") or "") or None,
                 last_message=str(last_scan.get("message") or "") or None,
             ),
@@ -691,9 +893,36 @@ class DownloadWatch(_PluginBase):
                         "component": "VRow",
                         "content": [
                             self._col(3, [self._switch("enabled", "启用插件")]),
-                            self._col(3, [self._switch("notify", "清理后通知")]),
+                            self._col(3, [self._switch("notify", "消息通知")]),
                             self._col(3, [self._switch("dry_run", "演练模式")]),
                             self._col(3, [self._switch("once", "保存后立即扫描")]),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self._col(
+                                3,
+                                [
+                                    self._switch(
+                                        "notify_watch",
+                                        "监控通知",
+                                        "有任务新进入监控时推送",
+                                    )
+                                ],
+                            ),
+                            self._col(
+                                3,
+                                [
+                                    self._switch(
+                                        "notify_remove",
+                                        "删除通知",
+                                        "删除任务时推送",
+                                    )
+                                ],
+                            ),
+                            self._col(3, [self._switch("delete_files", "同时删除文件")]),
+                            self._col(3, [self._switch("use_blacklist", "删除后拉黑")]),
                         ],
                     },
                     {
@@ -749,13 +978,6 @@ class DownloadWatch(_PluginBase):
                                     )
                                 ],
                             ),
-                            self._col(3, [self._switch("delete_files", "同时删除文件")]),
-                            self._col(3, [self._switch("use_blacklist", "删除后拉黑")]),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
                             self._col(
                                 6,
                                 [
@@ -785,11 +1007,19 @@ class DownloadWatch(_PluginBase):
 
     def get_page(self) -> List[dict]:
         """
-        返回详情页，展示当前配置与最近一次扫描结论。
+        返回详情页：运行配置、计数卡片，以及监控中与已删除的任务列表。
         """
         state = self._load_state()
+        records = self._records or self._load_records()
         last_scan = self._last_scan or self._load_last_scan()
         tags = split_tags(self._config.get("tags"))
+        watched_rows = list(records.get("watched") or [])
+        removed_rows = list(records.get("removed") or [])
+        notify_state = "关" if not self._config.get("notify") else (
+            "监控/删除"
+            if self._config.get("notify_watch") and self._config.get("notify_remove")
+            else ("仅监控" if self._config.get("notify_watch") else ("仅删除" if self._config.get("notify_remove") else "关"))
+        )
         status_text = (
             f"插件状态：{'已启用' if self._enabled else '未启用'}\n"
             f"判定条件：等待 ≥ {self._config.get('max_hours')} 小时 且 进度 ≤ {self._config.get('min_progress')}%\n"
@@ -797,7 +1027,8 @@ class DownloadWatch(_PluginBase):
             f"扫描周期：{self._config.get('cron')}\n"
             f"删除文件：{'是' if self._config.get('delete_files') else '否'}　"
             f"演练模式：{'是' if self._config.get('dry_run') else '否'}　"
-            f"拉黑：{'是' if self._config.get('use_blacklist') else '否'}"
+            f"拉黑：{'是' if self._config.get('use_blacklist') else '否'}　"
+            f"通知：{notify_state}"
         )
         page: List[dict] = [
             {
@@ -812,60 +1043,115 @@ class DownloadWatch(_PluginBase):
             {
                 "component": "VRow",
                 "content": [
+                    self._col(3, [self._stat_card("最近扫描", str(last_scan.get("time") or "尚未扫描"), "success")]),
+                    self._col(3, [self._stat_card("监控中", f"{len(watched_rows)} 个任务正在计时", "info")]),
+                    self._col(3, [self._stat_card("已删除", f"累计 {len(removed_rows)} 条记录", "warning")]),
                     self._col(
-                        4,
+                        3,
                         [
-                            {
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "success",
-                                    "variant": "tonal",
-                                    "title": "最近扫描",
-                                    "text": str(last_scan.get("time") or "尚未扫描"),
-                                },
-                            }
-                        ],
-                    ),
-                    self._col(
-                        4,
-                        [
-                            {
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "warning",
-                                    "variant": "tonal",
-                                    "title": "黑名单",
-                                    "text": f"{len(state['blacklist'])} 条种子，再次出现会被立即清理",
-                                },
-                            }
-                        ],
-                    ),
-                    self._col(
-                        4,
-                        [
-                            {
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "info",
-                                    "variant": "tonal",
-                                    "title": "观察中",
-                                    "text": f"{len(state['first_seen'])} 个任务正在计时",
-                                },
-                            }
+                            self._stat_card(
+                                "黑名单",
+                                f"{len(state['blacklist'])} 条种子，再次出现会被立即清理",
+                                "error",
+                            )
                         ],
                     ),
                 ],
             },
         ]
+
+        if watched_rows:
+            page.append(
+                {
+                    "component": "h3",
+                    "props": {"class": "mt-6 mb-2"},
+                    "text": "监控中的任务",
+                }
+            )
+            page.append(
+                {
+                    "component": "VDataTable",
+                    "props": {
+                        "density": "compact",
+                        "items-per-page": 10,
+                        "headers": [
+                            {"title": "标题", "key": "title"},
+                            {"title": "进度", "key": "progress"},
+                            {"title": "已等待", "key": "wait"},
+                            {"title": "大小", "key": "size"},
+                            {"title": "速度", "key": "speed"},
+                            {"title": "标签", "key": "tags"},
+                            {"title": "首见时间", "key": "since"},
+                        ],
+                        "items": watched_rows,
+                    },
+                }
+            )
+        else:
+            page.append(
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "info",
+                        "variant": "tonal",
+                        "title": "监控中",
+                        "text": "当前没有处于监控中的下载任务。"
+                                "插件只监控未完成、且标签命中的任务；已完成或做种中的任务不会出现在这里。",
+                    },
+                }
+            )
+
+        if removed_rows:
+            page.append(
+                {
+                    "component": "h3",
+                    "props": {"class": "mt-6 mb-2"},
+                    "text": "已删除的任务",
+                }
+            )
+            page.append(
+                {
+                    "component": "VDataTable",
+                    "props": {
+                        "density": "compact",
+                        "items-per-page": 10,
+                        "headers": [
+                            {"title": "删除时间", "key": "time"},
+                            {"title": "标题", "key": "title"},
+                            {"title": "进度", "key": "progress"},
+                            {"title": "已等待", "key": "wait"},
+                            {"title": "原因", "key": "reason"},
+                            {"title": "文件", "key": "files"},
+                            {"title": "订阅处理", "key": "note"},
+                        ],
+                        "items": list(reversed(removed_rows)),
+                    },
+                }
+            )
+        else:
+            page.append(
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "info",
+                        "variant": "tonal",
+                        "title": "已删除",
+                        "text": "还没有删除过任务。开启演练模式跑一轮，可以先在「最近命中」里确认会被删掉的任务。",
+                    },
+                }
+            )
+
         detail = list(last_scan.get("detail") or [])
         if detail:
+            dry_run = bool(self._config.get("dry_run"))
             page.append(
                 {
                     "component": "VAlert",
                     "props": {
                         "type": "warning",
                         "variant": "tonal",
-                        "title": "最近清理明细",
+                        "title": "最近一次扫描命中明细"
+                                + ("（演练模式，未真正删除）" if dry_run else ""),
                         "text": "\n".join(str(item) for item in detail[-MAX_NOTIFY_LINES:]),
                     },
                 }
@@ -883,6 +1169,21 @@ class DownloadWatch(_PluginBase):
                 }
             )
         return page
+
+    @staticmethod
+    def _stat_card(title: str, text: str, kind: str = "info") -> dict:
+        """
+        生成详情页顶部的一枚计数卡片。
+        """
+        return {
+            "component": "VAlert",
+            "props": {
+                "type": kind,
+                "variant": "tonal",
+                "title": title,
+                "text": text,
+            },
+        }
 
     def stop_service(self) -> None:
         """

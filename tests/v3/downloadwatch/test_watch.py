@@ -23,10 +23,13 @@ from app.plugins.downloadwatch.monitor import (
     REASON_PROGRESSING,
     REASON_REAP,
     REASON_TOO_YOUNG,
+    compose_notify,
     evaluate,
     format_duration,
+    format_size,
     is_finished,
     progress_text,
+    reason_text,
 )
 
 
@@ -219,3 +222,91 @@ def test_blacklist_reason_constant_distinct():
     黑名单原因与阈值原因需要区分，通知里才能看出是"再次出现"还是"第一次超时"。
     """
     assert REASON_BLACKLIST != REASON_REAP
+
+
+def test_format_size():
+    """
+    容量展示按 1024 进制进位，未知大小给占位文本。
+    """
+    assert format_size(0) == "未知"
+    assert format_size(None) == "未知"
+    assert format_size(860) == "860 B"
+    assert format_size(1536) == "1.5 KB"
+    assert format_size(2 * 1024 ** 3) == "2.0 GB"
+    assert format_size(3 * 1024 ** 4) == "3.0 TB"
+
+
+def test_reason_text():
+    """
+    判定原因要能翻译成页面与通知里的短语。
+    """
+    assert reason_text(REASON_REAP) == "超时且进度停滞"
+    assert reason_text(REASON_BLACKLIST) == "命中黑名单"
+    assert reason_text(REASON_FINISHED) == "已完成"
+    assert reason_text(REASON_PROGRESSING) == "进度正常"
+    assert reason_text("unknown") == "观察中"
+
+
+def test_compose_notify_returns_none_without_events():
+    """
+    没有任何事件时不产生通知，避免每轮扫描都推空消息。
+    """
+    assert compose_notify(
+        watched=[], removed=[], watched_total=0, blacklist_total=0, delete_files=False
+    ) is None
+
+
+def test_compose_notify_watch_only():
+    """
+    只有新增监控时，标题与正文只包含监控段。
+    """
+    draft = compose_notify(
+        watched=["A · 进度 0.0%"], removed=[], watched_total=3,
+        blacklist_total=1, delete_files=False,
+    )
+    assert draft is not None
+    assert draft.title == "下载监控：新增监控 1 个任务"
+    assert "【新增监控】1 个任务" in draft.text
+    assert "已删除" not in draft.text
+    assert "当前监控中 3 个任务，黑名单 1 条。" in draft.text
+
+
+def test_compose_notify_merges_both_sections():
+    """
+    同一轮既有删除又有新增监控时合并成一条通知，删除段在前。
+    """
+    draft = compose_notify(
+        watched=["A"], removed=["B", "C"], watched_total=1,
+        blacklist_total=0, delete_files=True,
+    )
+    assert draft is not None
+    assert draft.title == "下载监控：删除 2 个任务｜新增监控 1 个任务"
+    assert draft.text.startswith("【已删除】2 个任务（删除文件：是）")
+    assert "【新增监控】1 个任务" in draft.text
+
+
+def test_compose_notify_truncates_long_sections():
+    """
+    单段最多列举 limit 行，其余折叠成数量，避免通知过长。
+    """
+    draft = compose_notify(
+        watched=[], removed=[f"任务{i}" for i in range(25)],
+        watched_total=0, blacklist_total=0, delete_files=False, limit=10,
+    )
+    assert draft is not None
+    assert "其余 15 条已省略" in draft.text
+    assert draft.text.count("· ") == 11
+
+
+def test_notify_switches_default_on():
+    """
+    监控/删除通知默认开启，总开关独立控制。
+    """
+    config = normalize_config({"notify": False})
+    assert config["notify"] is False
+    assert config["notify_watch"] is True
+    assert config["notify_remove"] is True
+
+    config = normalize_config({"notify_watch": "0", "notify_remove": "true"})
+    assert config["notify_watch"] is False
+    assert config["notify_remove"] is True

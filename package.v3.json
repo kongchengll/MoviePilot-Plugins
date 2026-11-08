@@ -25,12 +25,13 @@
     "name": "下载监控",
     "description": "定时扫描下载任务，等待超过设定时长且进度仍低于阈值的任务自动删除，并把种子拉黑避免重复下载。",
     "labels": "下载,清理",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png",
     "author": "kongchengll",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.1.0": "新增任务通知：任务进入监控、删除任务时分别推送；详情页新增监控中与已删除任务列表。",
       "v1.0.0": "首次发布：超时且进度停滞的下载任务自动删除，支持标签过滤、演练模式、删除后拉黑与写入订阅排除规则。"
     }
   }

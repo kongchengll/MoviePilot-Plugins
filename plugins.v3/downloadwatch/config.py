@@ -15,6 +15,12 @@ DEFAULT_CRON = "*/10 * * * *"
 # 黑名单保留上限，避免长期运行后数据无限增长
 MAX_BLACKLIST = 500
 
+# 详情页「已删除」记录保留条数
+MAX_REMOVED_RECORDS = 100
+
+# 详情页「监控中」快照保留条数
+MAX_WATCH_RECORDS = 200
+
 # 单轮通知里最多列举的条目数，超出部分只给数量
 MAX_NOTIFY_LINES = 10
 
@@ -29,8 +35,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "tags": "",
     # 删除任务时是否同时删除已下载文件
     "delete_files": False,
-    # 删除后是否发通知
+    # 通知总开关
     "notify": True,
+    # 任务进入监控时通知
+    "notify_watch": True,
+    # 删除任务时通知
+    "notify_remove": True,
     # 演练模式：只记录将要删除的任务，不真正删除
     "dry_run": False,
     # 删除后写入本地黑名单，任务再次出现时立即清理
@@ -87,6 +97,8 @@ def normalize_config(config: Optional[Mapping[str, Any]]) -> dict[str, Any]:
 
     result["delete_files"] = _as_bool(raw.get("delete_files"), DEFAULT_CONFIG["delete_files"])
     result["notify"] = _as_bool(raw.get("notify"), DEFAULT_CONFIG["notify"])
+    result["notify_watch"] = _as_bool(raw.get("notify_watch"), DEFAULT_CONFIG["notify_watch"])
+    result["notify_remove"] = _as_bool(raw.get("notify_remove"), DEFAULT_CONFIG["notify_remove"])
     result["dry_run"] = _as_bool(raw.get("dry_run"), DEFAULT_CONFIG["dry_run"])
     result["use_blacklist"] = _as_bool(raw.get("use_blacklist"), DEFAULT_CONFIG["use_blacklist"])
     result["sync_subscribe"] = _as_bool(raw.get("sync_subscribe"), DEFAULT_CONFIG["sync_subscribe"])
