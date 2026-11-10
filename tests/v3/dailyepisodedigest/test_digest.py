@@ -178,6 +178,15 @@ def test_render_empty():
     assert text == "10月23日没有新入库内容"
 
 
+def test_normalize_config_image_only():
+    """
+    「仅发送图片」默认开启，可显式关闭以恢复标题与执行回执。
+    """
+    assert normalize_config(None)["image_only"] is True
+    assert normalize_config({"image_only": False})["image_only"] is False
+    assert normalize_config({"image_only": "false"})["image_only"] is False
+
+
 def test_resolve_window_yesterday():
     """
     昨日窗口应覆盖前一自然日整天。

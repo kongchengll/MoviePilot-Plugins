@@ -77,7 +77,7 @@ class DailyEpisodeDigest(_PluginBase):
     plugin_name = "每日入库速报"
     plugin_desc = "定时统计每天新入库的剧集与电影，渲染成带封面的日报长图，通过 MoviePilot 通知渠道推送。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.6.1"
+    plugin_version = "2.6.2"
     plugin_label = "媒体库,通知"
     plugin_author = "kongchengll"
     plugin_config_prefix = "dailyepisodedigest_"
@@ -230,6 +230,9 @@ class DailyEpisodeDigest(_PluginBase):
             return
         if result.get("empty"):
             self._ack(channel, userid, f"已推送 {result.get('label')}：没有新入库内容")
+            return
+        # 「仅发送图片」模式下，日报图片本身就是执行结果，不再补一条文字回执
+        if result.get("image") and self._config.get("image_only", True):
             return
         self._ack(
             channel,
@@ -632,6 +635,27 @@ class DailyEpisodeDigest(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
+                            self._col(3, [self._switch("image_only", "仅发送图片")]),
+                            self._col(
+                                9,
+                                [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "density": "compact",
+                                            "text": "开启后，成功出图时通知里只有图片：不带标题、不带正文，"
+                                            "手动触发成功也不再回执行结果；出图失败降级为纯文本时仍发送文字清单。",
+                                        },
+                                    }
+                                ],
+                            ),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             self._col(
                                 12,
                                 [
@@ -643,7 +667,7 @@ class DailyEpisodeDigest(_PluginBase):
                                         "text": "【重要】通知渠道的「场景开关」必须勾选「插件」，"
                                         "否则宿主的 check_message 会把本插件的广播消息直接丢弃且不写日志。"
                                         "保存后可在消息渠道发送 /digest_status 查看诊断。"
-                                        "有图片时不再附带文字摘要，只发图片。"
+                                        "开启「仅发送图片」后，成功出图时只发图片，不带标题、正文和手动触发回执。"
                                         "手动触发：/digest_push，也可使用配置的「自定义触发词」直接触发推送，"
                                         "支持 /digest_push today 或 24h 临时切换统计范围。"
                                         "开启「图片追加票房」后，日报末尾会展示猫眼实时票房榜单。"
@@ -925,20 +949,25 @@ class DailyEpisodeDigest(_PluginBase):
         """
         通过宿主通知渠道发送消息。
 
-        有图片时正文传空字符串，避免图片下方出现多余的文本栏；
-        无图片时正文即为完整清单。
+        「仅发送图片」模式下，标题与正文都传空字符串、也不带链接：不少渠道会把 title
+        单独渲染成图片下方的一条文本消息，只有把 title 一起置空才是真正的纯图片。
+        无图片时仍发送标题 + 完整清单作为兜底。
         """
-        link = settings.MP_DOMAIN("#/history")
+        pure_image = bool(image) and bool(self._config.get("image_only", True))
+        send_title = "" if pure_image else title
+        send_text = "" if image else text
+        link = None if pure_image else settings.MP_DOMAIN("#/history")
         try:
             self.post_message(
                 mtype=MessageType.Plugin,
-                title=title,
-                text="" if image else text,
+                title=send_title,
+                text=send_text,
                 image=image,
                 link=link,
             )
             logger.info(
-                f"每日入库速报：已提交通知「{title}」{'（含图片）' if image else '（纯文本）'}；"
+                f"每日入库速报：已提交通知"
+                f"{'（纯图片）' if pure_image else '「' + title + '」' + ('（含图片）' if image else '（纯文本）')}；"
                 f"渠道若未在场景开关里勾选「{_MESSAGE_TYPE.value}」，消息会被宿主静默丢弃"
             )
         except Exception as error:  # noqa: BLE001 - 通知失败不应中断插件
