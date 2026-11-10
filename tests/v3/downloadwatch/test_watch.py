@@ -12,6 +12,7 @@ from app.plugins.downloadwatch.config import (
     DEFAULT_CONFIG,
     merge_exclude,
     normalize_config,
+    parse_episodes,
     parse_season,
     split_tags,
     tags_match,
@@ -338,3 +339,23 @@ def test_validate_tab_falls_back_to_default():
     assert DownloadWatch._validate_tab("detail") == "detail"
     assert DownloadWatch._validate_tab("../../etc/passwd") == "watched"
     assert DownloadWatch._validate_tab(None) == "watched"
+
+
+def test_parse_episodes_handles_host_history_text():
+    """
+    下载历史用 Exx 文本记录集数，种子标题用 SxxExx，两种写法都要能还原集号。
+    """
+    assert parse_episodes("E01") == [1]
+    assert parse_episodes("E01-E03") == [1, 2, 3]
+    assert parse_episodes("E01,E05") == [1, 5]
+    assert parse_episodes("S02E07") == [7]
+    assert parse_episodes("第03集") == []
+    assert parse_episodes(None) == []
+    assert parse_episodes("") == []
+
+
+def test_parse_episodes_ignores_absurd_range():
+    """
+    跨度异常的区间只取起点，避免把版本号一类的数字展开成几百集。
+    """
+    assert parse_episodes("E01-E900") == [1]

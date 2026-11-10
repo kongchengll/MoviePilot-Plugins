@@ -56,6 +56,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 _SEASON_PATTERN = re.compile(r"[Ss](\d{1,2})")
 
+# 集号文本：支持 E01、E01-E03、E01、E02 等宿主下载历史与种子标题里的常见写法
+_EPISODE_PATTERN = re.compile(r"[Ee](\d{1,4})(?:\s*[-~]\s*[Ee]?(\d{1,4}))?")
+
 
 def _as_bool(value: Any, default: bool = False) -> bool:
     """
@@ -196,3 +199,29 @@ def parse_season(season_episode: Any) -> Optional[int]:
     if not match:
         return None
     return int(match.group(1))
+
+
+def parse_episodes(text: Any) -> list[int]:
+    """
+    从 `E01`、`E01-E03`、`E01、E02` 一类的文本里取出集号列表。
+
+    宿主下载历史把季集写成 Exx 文本，种子标题里则是 SxxExx；两种写法都能命中。
+    范围写法会展开，但为避免把年份之类的异常区间当成集数，跨度超过 200 时只取起点。
+
+    :param text: 季集或标题文本
+    :return: 升序去重的集号列表；无法识别时返回空列表
+    """
+    result: set[int] = set()
+    for match in _EPISODE_PATTERN.finditer(str(text or "")):
+        start = int(match.group(1))
+        end = match.group(2)
+        if end is None:
+            if start > 0:
+                result.add(start)
+            continue
+        finish = int(end)
+        if 0 <= finish - start <= 200:
+            result.update(range(start, finish + 1))
+        elif start > 0:
+            result.add(start)
+    return sorted(result)

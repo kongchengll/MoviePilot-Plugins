@@ -4,7 +4,10 @@
 职责：按配置周期扫描下载器中「正在下载」的任务，把「已等待时长 ≥ X 小时且进度 ≤ Y%」
 的任务判定为卡死，删除任务（可选连文件一起删），并把该种子记入本地黑名单；黑名单里的
 种子再次被订阅下载时会被立即清理，从而避免同一个坏种子反复占用下载位。
-可选地把种子标题追加进对应订阅的排除规则，从源头阻止重复下载。
+
+删除任务时按下载历史定位对应订阅，把该集从订阅的「已下载进度」里撤回，否则宿主会认为
+这一集已经下过、之后永远不再搜索新的种子。可选地再把种子标题追加进订阅排除规则，
+从源头阻止重复下载（副作用是该标题的所有种子都会被排除）。
 详情页用四个按钮切换监控中、已删除、黑名单与最近命中四个列表，任务进入监控与被删除
 时均可推送通知。
 """
@@ -20,8 +23,9 @@ from pydantic import BaseModel, Field
 
 from app import schemas
 from app.chain.download import DownloadChain
+from app.db.oper.downloadhistory import DownloadHistoryOper
 from app.db.oper.subscribe import SubscribeOper
-from app.schemas.types import EventType, MessageType
+from app.schemas.types import EventType, MediaType, MessageType
 from app.sdk import scheduler as scheduler_sdk
 from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
@@ -37,6 +41,7 @@ from .config import (
     merge_exclude,
     normalize_config,
     normalize_title,
+    parse_episodes,
     parse_season,
     split_tags,
     tags_match,
@@ -113,9 +118,9 @@ class DownloadWatch(_PluginBase):
     """
 
     plugin_name = "下载监控"
-    plugin_desc = "定时扫描正在下载的任务，等待超过设定时长且进度仍低于阈值的自动删除，并把种子拉黑避免重复下载。"
+    plugin_desc = "定时扫描正在下载的任务，等待超过设定时长且进度仍低于阈值的自动删除；删除时回滚订阅已下载进度并拉黑种子，让订阅重新搜索其它种子。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_label = "下载,清理"
     plugin_author = "kongchengll"
     plugin_config_prefix = "downloadwatch_"
@@ -350,8 +355,14 @@ class DownloadWatch(_PluginBase):
                 black_hashes.add(torrent_hash)
 
             note = ""
+            # 删除任务后必须先回收订阅进度：宿主在提交下载时就写入了订阅的「已下载集数」，
+            # 不回滚的话订阅会认为该集已完成，之后无论重新订阅还是刷新都不会再搜这一集
+            history = self._load_download_history(torrent_hash)
+            progress_note = self._rollback_subscribe(history, title)
+            exclude_note = ""
             if self._config.get("sync_subscribe"):
-                note = self._sync_subscribe_exclude(torrent, title)
+                exclude_note = self._sync_subscribe_exclude(torrent, title, history)
+            note = "；".join(part for part in (progress_note, exclude_note) if part)
             detail.append(f"{label}{'｜' + note if note else ''}")
             remove_events.append(label)
             remove_rows.append(
@@ -550,7 +561,126 @@ class DownloadWatch(_PluginBase):
         logger.info(f"下载监控：已删除任务 {torrent_hash}（删除文件={delete_files}）")
         return True
 
-    def _sync_subscribe_exclude(self, torrent: Any, title: str) -> str:
+    @staticmethod
+    def _load_download_history(torrent_hash: str) -> Optional[Any]:
+        """
+        读取任务对应的下载历史，用于定位订阅与集数。
+
+        宿主在把种子提交给下载器时就写入了下载历史，这里读到的记录带着媒体来源、
+        媒体 ID 与集数文本，是插件唯一能可靠还原「这个任务属于哪个订阅的哪一集」的依据。
+
+        :param torrent_hash: 下载任务 hash
+        :return: 下载历史记录；读取失败或不存在时返回 None
+        """
+        try:
+            return DownloadHistoryOper().get_by_hash(torrent_hash)
+        except Exception as error:  # noqa: BLE001 - 历史不可读时只跳过依赖它的步骤
+            logger.warning(f"下载监控：读取下载历史失败：{error}")
+            return None
+
+    @staticmethod
+    def _match_subscriptions(
+        media_source: str,
+        media_id: str,
+        mtype: str,
+        season: Optional[int],
+    ) -> List[Any]:
+        """
+        按媒体标识定位订阅；能确定季号时只保留同季订阅。
+
+        :param media_source: 媒体来源，例如 tmdb
+        :param media_id: 媒体来源内的 ID
+        :param mtype: 媒体类型
+        :param season: 季号，可为空
+        :return: 匹配到的订阅列表
+        """
+        try:
+            subscriptions = SubscribeOper().list()
+        except Exception as error:  # noqa: BLE001 - 订阅不可读时不影响删除结论
+            logger.warning(f"下载监控：读取订阅失败：{error}")
+            return []
+        matched = [
+            item
+            for item in subscriptions
+            if str(getattr(item, "media_source", "") or "") == media_source
+            and str(getattr(item, "media_id", "") or "") == media_id
+            and str(getattr(item, "type", "") or "") == mtype
+        ]
+        if len(matched) > 1 and season is not None:
+            same_season = [item for item in matched if getattr(item, "season", None) == season]
+            if same_season:
+                matched = same_season
+        return matched
+
+    def _rollback_subscribe(self, history: Optional[Any], title: str) -> str:
+        """
+        把被删任务覆盖的集数从订阅的已下载进度里撤回。
+
+        宿主提交下载时就把这些集写进了订阅的 note（以及洗版订阅的 episode_priority），
+        不撤回则订阅认为该集已经下过，永远不会再搜索新的种子。
+
+        :param history: 该任务的下载历史，可为 None
+        :param title: 任务标题，历史缺少集数文本时用标题兜底解析
+        :return: 处理结论文本
+        """
+        if not history:
+            return "无下载历史，未回滚订阅进度"
+        media_source = str(getattr(history, "media_source", "") or "")
+        media_id = str(getattr(history, "media_id", "") or "")
+        mtype = str(getattr(history, "type", "") or "")
+        if not media_source or not media_id or not mtype:
+            return "下载历史缺少媒体标识，未回滚订阅进度"
+
+        season = parse_season(getattr(history, "seasons", None))
+        subscriptions = self._match_subscriptions(media_source, media_id, mtype, season)
+        if not subscriptions:
+            return "未找到对应订阅，未回滚订阅进度"
+        if len(subscriptions) > 1:
+            return f"匹配到 {len(subscriptions)} 个订阅，未回滚订阅进度"
+
+        subscribe = subscriptions[0]
+        episodes = parse_episodes(getattr(history, "episodes", None)) or parse_episodes(title)
+        note = [int(item) for item in (getattr(subscribe, "note", None) or []) if str(item).isdigit()]
+        if mtype == MediaType.TV.value:
+            if not episodes:
+                return "无法确定被删任务的集数，未回滚订阅进度"
+            targets = set(episodes)
+        else:
+            # 电影与音乐只有一项，插件删除任务即视为该项未完成
+            targets = set(note)
+
+        payload: Dict[str, Any] = {}
+        new_note = [episode for episode in note if episode not in targets]
+        if new_note != note:
+            payload["note"] = new_note
+        priority = dict(getattr(subscribe, "episode_priority", None) or {})
+        if priority:
+            target_keys = {str(item) for item in targets}
+            kept = {key: value for key, value in priority.items() if str(key) not in target_keys}
+            if kept != priority:
+                payload["episode_priority"] = kept
+        if not payload:
+            return f"订阅《{subscribe.name}》未记录该集，无需回滚"
+
+        try:
+            SubscribeOper().update(subscribe.id, payload)
+        except Exception as error:  # noqa: BLE001 - 写失败需要显式告知用户
+            logger.warning(f"下载监控：回滚订阅进度失败：{error}")
+            return "回滚订阅进度失败"
+
+        # 进度回滚后这份下载历史已无对应任务，顺手删掉，避免订阅详情继续显示已下载文件
+        history_id = getattr(history, "id", None)
+        if history_id is not None:
+            try:
+                DownloadHistoryOper().delete_history(int(history_id))
+            except Exception as error:  # noqa: BLE001 - 历史清理失败不影响进度回滚
+                logger.warning(f"下载监控：删除下载历史失败：{error}")
+        logger.info(
+            f"下载监控：已从订阅《{subscribe.name}》回滚 {sorted(targets)} 的下载进度"
+        )
+        return f"已回滚订阅《{subscribe.name}》的 {len(targets)} 集进度"
+
+    def _sync_subscribe_exclude(self, torrent: Any, title: str, history: Optional[Any]) -> str:
         """
         把种子标题追加到匹配订阅的排除规则，阻止再次订阅时选中同一个种子。
 
@@ -558,25 +688,21 @@ class DownloadWatch(_PluginBase):
 
         :param torrent: 下载任务对象
         :param title: 已归一化的标题，仅用于兜底匹配
+        :param history: 该任务的下载历史，可为 None
         :return: 处理结论文本
         """
-        name = str(getattr(torrent, "name", "") or "").strip() or title
-        season = parse_season(getattr(torrent, "season_episode", None))
-        try:
-            subscriptions = SubscribeOper().list()
-        except Exception as error:  # noqa: BLE001 - 订阅不可读时不影响删除结论
-            logger.warning(f"下载监控：读取订阅失败，跳过排除规则同步：{error}")
-            return "订阅读取失败，未同步排除规则"
+        if not history:
+            return "无下载历史，未同步排除规则"
+        media_source = str(getattr(history, "media_source", "") or "")
+        media_id = str(getattr(history, "media_id", "") or "")
+        mtype = str(getattr(history, "type", "") or "")
+        if not media_source or not media_id or not mtype:
+            return "下载历史缺少媒体标识，未同步排除规则"
 
-        matched = []
-        for subscribe in subscriptions:
-            if (subscribe.name or "").strip() != name:
-                continue
-            subscribe_season = getattr(subscribe, "season", None)
-            if season is not None and subscribe_season is not None and subscribe_season != season:
-                continue
-            matched.append(subscribe)
-
+        season = parse_season(getattr(history, "seasons", None)) or parse_season(
+            getattr(torrent, "season_episode", None)
+        )
+        matched = self._match_subscriptions(media_source, media_id, mtype, season)
         if not matched:
             return "未找到对应订阅，仅保留本地黑名单"
         if len(matched) > 1:
@@ -850,18 +976,28 @@ class DownloadWatch(_PluginBase):
                 "endpoint": self.api_tab,
                 "methods": ["GET"],
                 "auth": "bear",
+                "response_model": schemas.Response[Dict[str, Any]],
                 "summary": "切换详情页列表",
             },
         ]
 
-    def api_tab(self, tab: str = _DEFAULT_TAB) -> Dict[str, Any]:
+    def api_tab(self, tab: str = _DEFAULT_TAB) -> "schemas.Response[Dict[str, Any]]":
         """
         记录详情页当前选中的分页，页面随后由前端重新拉取。
 
+        必须返回宿主统一的三段式响应：页面渲染组件按 data 模式解析接口结果，
+        缺少 data 段会被判为无效响应，前端只弹「服务端返回了无效响应」。
+
         :param tab: 分页键，watched / removed / blacklist / detail
-        :return: 切换结果
+        :return: 宿主统一响应结构
         """
-        return {"success": True, "message": self._save_page_tab(tab)}
+        value = self._save_page_tab(tab)
+        label = dict(_PAGE_TABS).get(value, value)
+        return schemas.Response(
+            success=True,
+            message=f"已切换到「{label}」",
+            data={"tab": value},
+        )
 
     def api_scan_now(self) -> "schemas.Response[ScanResultData]":
         """
@@ -1061,7 +1197,10 @@ class DownloadWatch(_PluginBase):
                                     self._switch(
                                         "sync_subscribe",
                                         "写入订阅排除规则",
-                                        "把种子标题追加到对应订阅的排除正则，需能唯一定位订阅",
+                                        "可选：把整个种子标题写进订阅排除正则。副作用是同一标题的"
+                                        "其它种子（含其它站点）也会被排除，若该剧只有这一个版本，"
+                                        "这一集将一直下不到；删除后回滚订阅进度是本插件默认行为，"
+                                        "不依赖该开关。",
                                     )
                                 ],
                             ),
@@ -1256,7 +1395,9 @@ class DownloadWatch(_PluginBase):
             f"删除文件：{'是' if self._config.get('delete_files') else '否'}　"
             f"演练模式：{'是' if self._config.get('dry_run') else '否'}　"
             f"拉黑：{'是' if self._config.get('use_blacklist') else '否'}　"
-            f"通知：{notify_state}"
+            f"通知：{notify_state}\n"
+            f"删除任务时自动回滚订阅进度并重新搜索该集（固定开启）　"
+            f"写入订阅排除：{'开' if self._config.get('sync_subscribe') else '关'}"
         )
 
     def _tab_column(self, key: str, label: str, count: int, active: bool) -> dict:
