@@ -121,7 +121,7 @@ class DownloadWatch(_PluginBase):
     plugin_name = "下载监控"
     plugin_desc = "定时扫描正在下载的任务，等待超过设定时长且进度仍低于阈值的自动删除；删除时回滚订阅已下载进度并拉黑种子，让订阅重新搜索其它种子。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "1.4.0"
+    plugin_version = "1.5.0"
     plugin_label = "下载,清理"
     plugin_author = "kongchengll"
     plugin_config_prefix = "downloadwatch_"
@@ -1293,22 +1293,21 @@ class DownloadWatch(_PluginBase):
         active = self._validate_tab(self._page_tab)
 
         page: List[dict] = [
-            {
-                "component": "VAlert",
-                "props": {
-                    "type": "info",
-                    "variant": "tonal",
-                    "title": "运行配置",
-                    "text": self._status_text(last_scan),
-                },
-            },
+            self._config_card(last_scan),
             {
                 "component": "VRow",
-                "props": {"class": "mt-1"},
+                "props": {"class": "mt-3"},
                 "content": [
                     self._tab_column(key, label, counts.get(key, 0), key == active)
                     for key, label in _PAGE_TABS
                 ],
+            },
+            {
+                "component": "div",
+                "props": {
+                    "class": "text-overline text-medium-emphasis mt-4 mb-2",
+                },
+                "text": dict(_PAGE_TABS).get(active, ""),
             },
         ]
 
@@ -1322,26 +1321,44 @@ class DownloadWatch(_PluginBase):
             total = counts.get(active, 0)
             if total > len(rows):
                 page.append(
-                    {
-                        "component": "VAlert",
-                        "props": {
-                            "type": "info",
-                            "variant": "text",
-                            "density": "compact",
-                            "text": f"仅显示前 {len(rows)} 条，共 {total} 条。",
-                        },
-                    }
+                    self._footnote(f"仅显示最近 {len(rows)} 条，共 {total} 条。")
                 )
         else:
             page.append(
                 {
-                    "component": "VAlert",
-                    "props": {
-                        "type": empty_kind,
-                        "variant": "tonal",
-                        "title": "暂无数据",
-                        "text": empty_text,
-                    },
+                    "component": "VCard",
+                    "props": {"variant": "outlined", "class": "pa-6"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex flex-column align-center"},
+                            "content": [
+                                {
+                                    "component": "VAvatar",
+                                    "props": {
+                                        "size": 44,
+                                        "color": empty_kind,
+                                        "variant": "tonal",
+                                        "class": "mb-3",
+                                    },
+                                    "text": "0",
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-subtitle-2 mb-1"},
+                                    "text": "暂无数据",
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {
+                                        "class": "text-caption text-medium-emphasis text-center",
+                                        "style": "max-width: 620px",
+                                    },
+                                    "text": empty_text,
+                                },
+                            ],
+                        }
+                    ],
                 }
             )
 
@@ -1350,8 +1367,10 @@ class DownloadWatch(_PluginBase):
                 {
                     "component": "VAlert",
                     "props": {
-                        "type": "error",
+                        "type": "warning",
                         "variant": "tonal",
+                        "density": "compact",
+                        "class": "mt-3",
                         "title": "插件未启用",
                         "text": "启用并保存配置后才会注册定时扫描服务；也可以先开启演练模式确认阈值是否合适。",
                     },
@@ -1374,10 +1393,11 @@ class DownloadWatch(_PluginBase):
         """
         if tab == "watched":
             rows = [
-                self._item(
-                    str(item.get("title") or "未知任务"),
-                    self._watched_meta(item),
-                    "info",
+                self._entry_card(
+                    title=str(item.get("title") or "未知任务"),
+                    chips=self._watched_chips(item),
+                    marker="监",
+                    color="primary",
                 )
                 for item in watched_rows[-MAX_LIST_ROWS:]
             ]
@@ -1390,10 +1410,11 @@ class DownloadWatch(_PluginBase):
         if tab == "removed":
             # 最新的排在最上面
             rows = [
-                self._item(
-                    str(item.get("title") or "未知任务"),
-                    self._removed_meta(item),
-                    "warning",
+                self._entry_card(
+                    title=str(item.get("title") or "未知任务"),
+                    chips=self._removed_chips(item),
+                    marker="删",
+                    color="warning",
                 )
                 for item in list(reversed(removed_rows))[:MAX_LIST_ROWS]
             ]
@@ -1414,7 +1435,12 @@ class DownloadWatch(_PluginBase):
             )
         dry_run = bool(self._config.get("dry_run"))
         rows = [
-            self._item(str(line), "", "warning")
+            self._entry_card(
+                title=str(line),
+                chips=[],
+                marker="记",
+                color="warning",
+            )
             for line in list(reversed(detail))[:MAX_LIST_ROWS]
         ]
         return (
@@ -1424,9 +1450,9 @@ class DownloadWatch(_PluginBase):
             "info",
         )
 
-    def _status_text(self, last_scan: Dict[str, Any]) -> str:
+    def _config_card(self, last_scan: Dict[str, Any]) -> dict:
         """
-        生成顶部运行配置说明。
+        顶部运行配置卡：状态、阈值、次要配置分层展示，避免长文本挤成一团。
         """
         tags = split_tags(self._config.get("tags"))
         notify_state = "关" if not self._config.get("notify") else (
@@ -1435,30 +1461,110 @@ class DownloadWatch(_PluginBase):
             else ("仅监控" if self._config.get("notify_watch")
                   else ("仅删除" if self._config.get("notify_remove") else "关"))
         )
-        return (
-            f"插件状态：{'已启用' if self._enabled else '未启用'}　"
-            f"最近扫描：{last_scan.get('time') or '尚未扫描'}\n"
-            f"判定条件：正在下载，且已等待 ≥ {self._config.get('max_hours')} 小时、"
-            f"进度 ≤ {self._config.get('min_progress')}%\n"
-            f"监控标签：{'、'.join(tags) if tags else '全部任务'}　"
-            f"扫描周期：{self._config.get('cron')}\n"
-            f"删除文件：{'是' if self._config.get('delete_files') else '否'}　"
-            f"演练模式：{'是' if self._config.get('dry_run') else '否'}　"
-            f"拉黑：{'是' if self._config.get('use_blacklist') else '否'}　"
-            f"通知：{notify_state}\n"
-            f"删除任务时自动回滚订阅进度并重新搜索该集（固定开启）　"
-            f"写入订阅排除：{'开' if self._config.get('sync_subscribe') else '关'}"
+        yes_no = lambda flag: "是" if self._config.get(flag) else "否"
+        chips = [
+            self._chip(f"等待 ≥ {self._config.get('max_hours')} 小时", "primary", True),
+            self._chip(f"进度 ≤ {self._config.get('min_progress')}%", "primary", True),
+            self._chip(f"标签 {'、'.join(tags) if tags else '全部任务'}"),
+            self._chip(f"周期 {self._config.get('cron')}"),
+            self._chip(f"删除文件 {yes_no('delete_files')}"),
+            self._chip(f"演练 {yes_no('dry_run')}"),
+            self._chip(f"拉黑 {yes_no('use_blacklist')}"),
+            self._chip(f"通知 {notify_state}"),
+        ]
+        note = (
+            "删除任务时自动回滚订阅进度并重新搜索该集（固定开启）"
+            f"　·　写入订阅排除：{'开' if self._config.get('sync_subscribe') else '关'}"
         )
+        return {
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": "pa-4"},
+            "content": [
+                {
+                    "component": "div",
+                    "props": {"class": "d-flex align-center flex-wrap"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {
+                                "class": "bg-primary rounded mr-2 flex-shrink-0",
+                                "style": "width: 4px; height: 18px",
+                            },
+                        },
+                        {
+                            "component": "span",
+                            "props": {"class": "text-subtitle-2 font-weight-bold"},
+                            "text": "运行配置",
+                        },
+                        {
+                            "component": "VChip",
+                            "props": {
+                                "size": "x-small",
+                                "label": True,
+                                "variant": "tonal",
+                                "color": "success" if self._enabled else "warning",
+                                "class": "ml-2",
+                            },
+                            "text": "已启用" if self._enabled else "未启用",
+                        },
+                        {
+                            "component": "span",
+                            "props": {
+                                "class": "text-caption text-medium-emphasis ml-auto"
+                            },
+                            "text": f"最近扫描 {last_scan.get('time') or '尚未扫描'}",
+                        },
+                    ],
+                },
+                {
+                    "component": "div",
+                    "props": {"class": "d-flex flex-wrap mt-3"},
+                    "content": chips,
+                },
+                {
+                    "component": "div",
+                    "props": {"class": "text-caption text-medium-emphasis mt-2"},
+                    "text": f"说明：{note}",
+                },
+            ],
+        }
+
+    @staticmethod
+    def _chip(text: str, color: Optional[str] = None, prominent: bool = False) -> dict:
+        """
+        生成一枚小信息标签。前两个关键阈值用实心色调，其余用细边框降噪。
+        """
+        props: Dict[str, Any] = {
+            "size": "x-small",
+            "label": True,
+            "variant": "tonal" if prominent else "outlined",
+            "class": "mr-2 mb-2",
+        }
+        if color:
+            props["color"] = color
+        return {"component": "VChip", "props": props, "text": text}
+
+    @staticmethod
+    def _footnote(text: str) -> dict:
+        """
+        列表下方的浅色脚注。
+        """
+        return {
+            "component": "div",
+            "props": {"class": "text-caption text-medium-emphasis mt-2"},
+            "text": text,
+        }
 
     def _tab_column(self, key: str, label: str, count: int, active: bool) -> dict:
         """
-        生成一个分页按钮，四个按钮等宽等高，仅选中项高亮。
+        生成一枚等宽等高的分页按钮：上方「图标 + 名称」，下方数字，选中项整块高亮。
         """
         props: Dict[str, Any] = {
             "block": True,
-            "height": 64,
-            "class": "text-none",
-            "variant": "flat" if active else "outlined",
+            "height": 68,
+            "rounded": "lg",
+            "class": "text-none pa-2",
+            "variant": "tonal" if active else "outlined",
         }
         if active:
             props["color"] = "primary"
@@ -1476,117 +1582,195 @@ class DownloadWatch(_PluginBase):
                         }
                     },
                     "content": [
-                        {"component": "span", "props": {"class": "text-body-2"}, "text": label},
                         {
-                            "component": "span",
-                            "props": {"class": "text-h6 font-weight-bold ms-2"},
-                            "text": str(count),
-                        },
+                            "component": "div",
+                            "props": {"class": "d-flex flex-column align-center justify-center"},
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {"class": "d-flex align-center"},
+                                    "content": [
+                                        {
+                                            "component": "div",
+                                            "props": {
+                                                "class": "rounded-circle mr-2 flex-shrink-0",
+                                                "style": "width: 7px; height: 7px; background: currentColor;"
+                                                + ("" if active else " opacity: 0.45"),
+                                            },
+                                        },
+                                        {
+                                            "component": "span",
+                                            "props": {"class": "text-body-2"},
+                                            "text": label,
+                                        },
+                                    ],
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-h6 font-weight-bold mt-1"},
+                                    "text": str(count),
+                                },
+                            ],
+                        }
                     ],
                 }
             ],
         )
 
-    def _blacklist_hint(self) -> dict:
+    @staticmethod
+    def _blacklist_hint() -> dict:
         """
-        黑名单分页顶部的操作提示。
+        黑名单分页顶部的浅色操作提示。
         """
         return {
-            "component": "VAlert",
+            "component": "div",
             "props": {
-                "type": "info",
-                "variant": "text",
-                "density": "compact",
-                "class": "mb-1",
-                "text": "点条目右侧的「移除」可单独删掉这条拉黑记录；移除后该种子再出现不会再被自动删除。",
+                "class": "text-caption text-medium-emphasis d-flex align-center mb-2",
             },
+            "content": [
+                {
+                    "component": "span",
+                    "text": "提示：点条目右侧的「移除」即可删掉这条拉黑记录；移除后该种子再出现不会再被自动删除。",
+                },
+            ],
+        }
+
+    def _entry_card(
+        self,
+        title: str,
+        chips: List[str],
+        marker: str,
+        color: str,
+        action: Optional[dict] = None,
+    ) -> dict:
+        """
+        生成一条卡片式记录：左侧状态徽标，中间标题 + 小标签，右侧可选操作按钮。
+
+        用卡片而不是 VAlert，是为了让长标题单独成行、元数据按标签分组，信息密度更高
+        且不会像一整串 `·` 文本那样糊成一片。徽标用文字而非 mdi 图标：宿主的图标是
+        构建时静态扫描打包的，插件页 JSON 里临时写图标名不一定能加载出来。
+
+        :param title: 记录标题
+        :param chips: 元数据标签文本
+        :param marker: 左侧徽标文字（单个汉字）
+        :param color: 状态色
+        :param action: 右侧操作按钮（黑名单的「移除」）
+        :return: 页面元素
+        """
+        main: List[dict] = [
+            {
+                "component": "div",
+                "props": {
+                    "class": "text-body-2 font-weight-medium",
+                    "style": "overflow-wrap: anywhere",
+                },
+                "text": title,
+            }
+        ]
+        if chips:
+            main.append(
+                {
+                    "component": "div",
+                    "props": {"class": "d-flex flex-wrap mt-2"},
+                    "content": [
+                        # 前两个是判断依据（或时间/原因），用实心色调强调；其余用细边框降噪
+                        self._chip(
+                            text,
+                            color if index < 2 else None,
+                            index < 2,
+                        )
+                        for index, text in enumerate(chips)
+                    ],
+                }
+            )
+        inner: List[dict] = [
+            {
+                "component": "VAvatar",
+                "props": {
+                    "size": 30,
+                    "color": color,
+                    "variant": "tonal",
+                    "rounded": "lg",
+                    "class": "mr-3 mt-1 flex-shrink-0 text-body-2 font-weight-bold",
+                },
+                "text": marker,
+            },
+            {
+                "component": "div",
+                "props": {"class": "flex-grow-1", "style": "min-width: 0"},
+                "content": main,
+            },
+        ]
+        if action:
+            inner.append(action)
+        return {
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": "mb-2"},
+            "content": [
+                {
+                    "component": "div",
+                    "props": {"class": "d-flex align-start pa-3"},
+                    "content": inner,
+                }
+            ],
         }
 
     def _blacklist_row(self, item: Dict[str, Any]) -> dict:
         """
-        生成一条黑名单记录：左侧标题与明细，右侧「移除」按钮。
+        生成一条黑名单记录：卡片 + 右侧「移除」按钮。
 
         :param item: 黑名单条目
         :return: 页面元素
         """
-        entry = self._item(
-            str(item.get("title") or "未知种子"),
-            self._blacklist_meta(item),
-            "error",
-        )
         key = str(item.get("hash") or "").strip()
-        if not key:
-            return entry
-        # 外层行已经带了下间距，去掉条目自身的 mb-1，避免两条记录之间空隙翻倍
-        entry["props"].pop("class", None)
-        return {
-            "component": "VRow",
-            "props": {"class": "mb-1", "no-gutters": True, "align": "center"},
-            "content": [
-                self._col(10, [entry]),
-                self._col(
-                    2,
-                    [
-                        {
-                            "component": "VBtn",
-                            "props": {
-                                "color": "error",
-                                "variant": "text",
-                                "size": "small",
-                                "height": 40,
-                                "block": True,
-                                "class": "text-none",
-                            },
-                            "text": "移除",
-                            "events": {
-                                "click": {
-                                    "api": f"/plugin/{self.__class__.__name__}/blacklist/remove",
-                                    "method": "get",
-                                    "params": {"hash": key},
-                                }
-                            },
-                        }
-                    ],
-                ),
-            ],
-        }
-
-    @staticmethod
-    def _item(title: str, meta: str, kind: str = "info") -> dict:
-        """
-        生成列表中的一条记录，标题一行、明细一行。
-        """
-        props: Dict[str, Any] = {
-            "type": kind,
-            "variant": "tonal",
-            "density": "compact",
-            "class": "mb-1",
-            "title": title,
-        }
-        if meta:
-            props["text"] = meta
-        return {"component": "VAlert", "props": props}
-
-    @staticmethod
-    def _watched_meta(row: Dict[str, Any]) -> str:
-        """
-        监控中任务的明细行。
-        """
-        return " · ".join(
-            [
-                f"进度 {row.get('progress') or '0.0%'}",
-                f"已等待 {row.get('wait') or '—'}",
-                f"大小 {row.get('size') or '未知'}",
-                f"速度 {row.get('speed') or '—'}",
-                f"标签 {row.get('tags') or '—'}",
-                f"首见 {row.get('since') or '—'}",
-            ]
+        action = None
+        if key:
+            action = {
+                "component": "VBtn",
+                "props": {
+                    "color": "error",
+                    "variant": "tonal",
+                    "size": "small",
+                    "rounded": "lg",
+                    "class": "text-none ml-3 flex-shrink-0",
+                },
+                "content": [
+                    {"component": "span", "text": "× 移除"},
+                ],
+                "events": {
+                    "click": {
+                        "api": f"/plugin/{self.__class__.__name__}/blacklist/remove",
+                        "method": "get",
+                        "params": {"hash": key},
+                    }
+                },
+            }
+        return self._entry_card(
+            title=str(item.get("title") or "未知种子"),
+            chips=self._blacklist_chips(item),
+            marker="禁",
+            color="error",
+            action=action,
         )
 
     @staticmethod
-    def _removed_meta(row: Dict[str, Any]) -> str:
+    def _watched_chips(row: Dict[str, Any]) -> List[str]:
         """
-        已删除任务的明细行。
+        监控中任务的元数据标签。
+        """
+        return [
+            f"进度 {row.get('progress') or '0.0%'}",
+            f"已等待 {row.get('wait') or '—'}",
+            f"大小 {row.get('size') or '未知'}",
+            f"速度 {row.get('speed') or '—'}",
+            f"标签 {row.get('tags') or '—'}",
+            f"首见 {row.get('since') or '—'}",
+        ]
+
+    @staticmethod
+    def _removed_chips(row: Dict[str, Any]) -> List[str]:
+        """
+        已删除任务的元数据标签。
         """
         parts = [
             str(row.get("time") or "—"),
@@ -1598,22 +1782,22 @@ class DownloadWatch(_PluginBase):
         note = str(row.get("note") or "").strip()
         if note and note != "—":
             parts.append(note)
-        return " · ".join(parts)
+        return parts
 
     @staticmethod
-    def _blacklist_meta(item: Dict[str, Any]) -> str:
+    def _blacklist_chips(item: Dict[str, Any]) -> List[str]:
         """
-        黑名单条目的明细行。
+        黑名单条目的元数据标签。
         """
-        reason = reason_text(str(item.get("reason") or ""))
-        return " · ".join(
-            [
-                str(item.get("removed_at") or "—"),
-                reason,
-                f"hash {str(item.get('hash') or '')[:12]}",
-            ]
-        )
-
+        parts = [
+            str(item.get("removed_at") or "—"),
+            reason_text(str(item.get("reason") or "")),
+            f"hash {str(item.get('hash') or '')[:12]}",
+        ]
+        downloader = str(item.get("downloader") or "").strip()
+        if downloader:
+            parts.append(f"下载器 {downloader}")
+        return parts
 
     def stop_service(self) -> None:
         """
