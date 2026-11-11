@@ -14,6 +14,7 @@ from app.plugins.downloadwatch.config import (
     normalize_config,
     parse_episodes,
     parse_season,
+    remove_blacklist_item,
     split_tags,
     tags_match,
     task_tags,
@@ -359,3 +360,50 @@ def test_parse_episodes_ignores_absurd_range():
     跨度异常的区间只取起点，避免把版本号一类的数字展开成几百集。
     """
     assert parse_episodes("E01-E900") == [1]
+
+
+def test_remove_blacklist_item_matches_hash_case_insensitively():
+    """
+    下载器返回的 hash 大小写不统一，移除时按小写比对，且只删命中的一条。
+    """
+    blacklist = [
+        {"hash": "AAA111", "title": "Bad.One.1080p"},
+        {"hash": "bbb222", "title": "Bad.Two.1080p"},
+    ]
+    kept, removed = remove_blacklist_item(blacklist, hash_value="aaa111")
+    assert [item["hash"] for item in removed] == ["AAA111"]
+    assert [item["hash"] for item in kept] == ["bbb222"]
+
+
+def test_remove_blacklist_item_falls_back_to_title():
+    """
+    老记录可能没有 hash，此时按标题全等匹配，避免误删同名不同版本之外的条目。
+    """
+    blacklist = [
+        {"hash": "", "title": "Bad.One.1080p"},
+        {"hash": "", "title": "Bad.One.1080p.EXTENDED"},
+    ]
+    kept, removed = remove_blacklist_item(blacklist, title=" Bad.One.1080p ")
+    assert len(removed) == 1 and removed[0]["title"] == "Bad.One.1080p"
+    assert [item["title"] for item in kept] == ["Bad.One.1080p.EXTENDED"]
+
+
+def test_remove_blacklist_item_requires_identifier():
+    """
+    既没有 hash 也没有标题时不得改动黑名单，防止误清空。
+    """
+    blacklist = [{"hash": "aaa111", "title": "Bad.One.1080p"}]
+    kept, removed = remove_blacklist_item(blacklist, hash_value="", title="")
+    assert removed == []
+    assert len(kept) == 1
+
+
+def test_remove_blacklist_item_ignores_dirty_entries():
+    """
+    持久化数据可能混入非字典条目，移除时直接丢弃，不抛异常。
+    """
+    kept, removed = remove_blacklist_item(
+        [{"hash": "aaa111", "title": "Bad"}, "oops", None], hash_value="zzz"
+    )
+    assert removed == []
+    assert kept == [{"hash": "aaa111", "title": "Bad"}]

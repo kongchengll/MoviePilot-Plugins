@@ -189,6 +189,38 @@ def merge_exclude(existing: Any, keyword: Any) -> str:
     return f"{current}|{escaped}"
 
 
+def remove_blacklist_item(
+    blacklist: Iterable[Any], hash_value: Any = "", title: Any = ""
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    从黑名单里摘掉指定条目。
+
+    优先按种子 hash 精确匹配（大小写不敏感），只有在没给 hash 时才退化为按标题
+    全等匹配 —— 标题可能被同名种子的不同压制版本复用，不能作为默认依据。
+
+    :param blacklist: 当前黑名单条目列表
+    :param hash_value: 待移除种子的 hash
+    :param title: 待移除种子的标题，仅在缺少 hash 时使用
+    :return: (保留的条目, 被移除的条目)
+    """
+    items = [item for item in blacklist if isinstance(item, dict)]
+    key = str(hash_value or "").strip().lower()
+    name = normalize_title(title)
+    if not key and not name:
+        return items, []
+
+    kept: list[dict[str, Any]] = []
+    removed: list[dict[str, Any]] = []
+    for item in items:
+        item_hash = str(item.get("hash") or "").strip().lower()
+        hit = item_hash == key if key else normalize_title(item.get("title")) == name
+        if hit:
+            removed.append(item)
+            continue
+        kept.append(item)
+    return kept, removed
+
+
 def parse_season(season_episode: Any) -> Optional[int]:
     """
     从 `S01E03` 一类的季集文本里取出季号。

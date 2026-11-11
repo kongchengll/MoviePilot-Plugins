@@ -9,7 +9,7 @@
 这一集已经下过、之后永远不再搜索新的种子。可选地再把种子标题追加进订阅排除规则，
 从源头阻止重复下载（副作用是该标题的所有种子都会被排除）。
 详情页用四个按钮切换监控中、已删除、黑名单与最近命中四个列表，任务进入监控与被删除
-时均可推送通知。
+时均可推送通知；黑名单列表里的每一条都可以单独移除，误拉黑的种子不必手动改数据库。
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ from .config import (
     normalize_title,
     parse_episodes,
     parse_season,
+    remove_blacklist_item,
     split_tags,
     tags_match,
 )
@@ -120,7 +121,7 @@ class DownloadWatch(_PluginBase):
     plugin_name = "下载监控"
     plugin_desc = "定时扫描正在下载的任务，等待超过设定时长且进度仍低于阈值的自动删除；删除时回滚订阅已下载进度并拉黑种子，让订阅重新搜索其它种子。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     plugin_label = "下载,清理"
     plugin_author = "kongchengll"
     plugin_config_prefix = "downloadwatch_"
@@ -343,6 +344,12 @@ class DownloadWatch(_PluginBase):
             removed += 1
             first_seen.pop(torrent_hash, None)
             if use_blacklist:
+                # 同一个种子被反复下载时只保留最新一条，否则列表里会堆出一串同名记录
+                blacklist = [
+                    item
+                    for item in blacklist
+                    if str(item.get("hash") or "").strip().lower() != torrent_hash
+                ]
                 blacklist.append(
                     {
                         "hash": torrent_hash,
@@ -979,6 +986,14 @@ class DownloadWatch(_PluginBase):
                 "response_model": schemas.Response[Dict[str, Any]],
                 "summary": "切换详情页列表",
             },
+            {
+                "path": "/blacklist/remove",
+                "endpoint": self.api_blacklist_remove,
+                "methods": ["GET"],
+                "auth": "bear",
+                "response_model": schemas.Response[Dict[str, Any]],
+                "summary": "移除一条黑名单记录",
+            },
         ]
 
     def api_tab(self, tab: str = _DEFAULT_TAB) -> "schemas.Response[Dict[str, Any]]":
@@ -997,6 +1012,43 @@ class DownloadWatch(_PluginBase):
             success=True,
             message=f"已切换到「{label}」",
             data={"tab": value},
+        )
+
+    def api_blacklist_remove(
+        self, hash: str = "", title: str = ""
+    ) -> "schemas.Response[Dict[str, Any]]":
+        """
+        从本地黑名单里移除一条记录。
+
+        页面上的「移除」按钮按 hash 传参，hash 缺失时才退回标题全等匹配。移除后该
+        种子不再被当轮秒删；如果它仍在下载器里，下一轮扫描会重新按阈值判断。
+
+        :param hash: 待移除种子的 hash
+        :param title: 待移除种子的标题，仅在缺少 hash 时使用
+        :return: 宿主统一响应结构
+        """
+        state = self._load_state()
+        current = len(state["blacklist"])
+        if not str(hash or "").strip() and not str(title or "").strip():
+            return schemas.Response(
+                success=False,
+                message="缺少要移除的种子标识",
+                data={"removed": 0, "blacklist": current},
+            )
+        kept, removed = remove_blacklist_item(state["blacklist"], hash, title)
+        if not removed:
+            return schemas.Response(
+                success=False,
+                message="黑名单里已经没有这条记录，可能刚被移除",
+                data={"removed": 0, "blacklist": len(kept)},
+            )
+        self._save_state({"first_seen": state["first_seen"], "blacklist": kept})
+        name = str(removed[0].get("title") or removed[0].get("hash") or "未知种子")
+        logger.info(f"下载监控：已手动移除黑名单条目「{name}」，剩余 {len(kept)} 条")
+        return schemas.Response(
+            success=True,
+            message=f"已移除「{name}」，剩余 {len(kept)} 条",
+            data={"removed": len(removed), "blacklist": len(kept)},
         )
 
     def api_scan_now(self) -> "schemas.Response[ScanResultData]":
@@ -1264,6 +1316,8 @@ class DownloadWatch(_PluginBase):
             active, watched_rows, removed_rows, blacklist, detail
         )
         if rows:
+            if active == "blacklist":
+                page.append(self._blacklist_hint())
             page.extend(rows)
             total = counts.get(active, 0)
             if total > len(rows):
@@ -1350,11 +1404,7 @@ class DownloadWatch(_PluginBase):
             )
         if tab == "blacklist":
             rows = [
-                self._item(
-                    str(item.get("title") or "未知种子"),
-                    self._blacklist_meta(item),
-                    "error",
-                )
+                self._blacklist_row(item)
                 for item in list(reversed(blacklist))[:MAX_LIST_ROWS]
             ]
             return (
@@ -1436,6 +1486,70 @@ class DownloadWatch(_PluginBase):
                 }
             ],
         )
+
+    def _blacklist_hint(self) -> dict:
+        """
+        黑名单分页顶部的操作提示。
+        """
+        return {
+            "component": "VAlert",
+            "props": {
+                "type": "info",
+                "variant": "text",
+                "density": "compact",
+                "class": "mb-1",
+                "text": "点条目右侧的「移除」可单独删掉这条拉黑记录；移除后该种子再出现不会再被自动删除。",
+            },
+        }
+
+    def _blacklist_row(self, item: Dict[str, Any]) -> dict:
+        """
+        生成一条黑名单记录：左侧标题与明细，右侧「移除」按钮。
+
+        :param item: 黑名单条目
+        :return: 页面元素
+        """
+        entry = self._item(
+            str(item.get("title") or "未知种子"),
+            self._blacklist_meta(item),
+            "error",
+        )
+        key = str(item.get("hash") or "").strip()
+        if not key:
+            return entry
+        # 外层行已经带了下间距，去掉条目自身的 mb-1，避免两条记录之间空隙翻倍
+        entry["props"].pop("class", None)
+        return {
+            "component": "VRow",
+            "props": {"class": "mb-1", "no-gutters": True, "align": "center"},
+            "content": [
+                self._col(10, [entry]),
+                self._col(
+                    2,
+                    [
+                        {
+                            "component": "VBtn",
+                            "props": {
+                                "color": "error",
+                                "variant": "text",
+                                "size": "small",
+                                "height": 40,
+                                "block": True,
+                                "class": "text-none",
+                            },
+                            "text": "移除",
+                            "events": {
+                                "click": {
+                                    "api": f"/plugin/{self.__class__.__name__}/blacklist/remove",
+                                    "method": "get",
+                                    "params": {"hash": key},
+                                }
+                            },
+                        }
+                    ],
+                ),
+            ],
+        }
 
     @staticmethod
     def _item(title: str, meta: str, kind: str = "info") -> dict:
