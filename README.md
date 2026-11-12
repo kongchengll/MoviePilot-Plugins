@@ -22,8 +22,9 @@ MoviePilot官方插件市场：https://github.com/jxxghp/MoviePilot-Plugins
 ### [下载监控](https://github.com/kongchengll/MoviePilot-Plugins/tree/main/plugins.v3/downloadwatch)
   > MoviePilot V3 插件
 
-  定时扫描下载任务，把「等待 ≥ X 小时且进度 ≤ Y%」的任务判定为卡死并删除，
-  支持按下载器标签筛选、演练模式、删除时是否连文件一起删。
+  定时扫描下载任务，两条规则任一命中即清理：「等待 ≥ X 小时且进度 ≤ Y%」的卡死任务，
+  以及监控满 24 小时仍未下载完成的任务（默认连本地文件一起删）。支持按下载器标签
+  筛选、演练模式、规则二独立的删除文件开关。
 
   删除任务后会按下载历史回滚对应订阅的「已下载进度」，让订阅重新搜索这一集（否则宿主会
   认为该集已经下过、永远跳过）；种子同时进入本地黑名单，再次被下载时当轮清理。也可以

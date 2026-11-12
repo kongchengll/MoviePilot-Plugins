@@ -22,11 +22,13 @@ from app.plugins.downloadwatch.config import (
 from app.plugins.downloadwatch.monitor import (
     REASON_BLACKLIST,
     REASON_FINISHED,
+    REASON_FORCE_TIMEOUT,
     REASON_PROGRESSING,
     REASON_REAP,
     REASON_TOO_YOUNG,
     compose_notify,
     evaluate,
+    evaluate_force,
     format_duration,
     format_size,
     is_downloading,
@@ -407,3 +409,64 @@ def test_remove_blacklist_item_ignores_dirty_entries():
     )
     assert removed == []
     assert kept == [{"hash": "aaa111", "title": "Bad"}]
+
+
+def test_force_timeout_reaps_slow_but_active_task():
+    """
+    强制规则不看进度：满时限仍未完成就清理，兜住「一直在动但下不完」的慢种。
+    """
+    decision = evaluate_force(progress=80, age_seconds=25 * 3600, force_hours=24)
+    assert decision.reap is True
+    assert decision.reason == REASON_FORCE_TIMEOUT
+
+
+def test_force_timeout_protects_finished_and_young_tasks():
+    """
+    已完成、刚开始观察、未满时限的任务都不清理。
+    """
+    assert evaluate_force(progress=99.95, age_seconds=25 * 3600, force_hours=24).reason == REASON_FINISHED
+    assert evaluate_force(progress=80, age_seconds=None, force_hours=24).reason == REASON_TOO_YOUNG
+    assert evaluate_force(
+        progress=80, age_seconds=24 * 3600 - 1, force_hours=24
+    ).reason == REASON_TOO_YOUNG
+    assert evaluate_force(progress=80, age_seconds=26 * 3600, force_hours=48).reap is False
+
+
+def test_force_timeout_hour_has_a_floor():
+    """
+    非法或为零的时长回落到 1 小时，避免每轮扫描把刚加的任务全删掉。
+    """
+    assert evaluate_force(progress=0, age_seconds=30 * 60, force_hours=0).reap is False
+    assert evaluate_force(progress=0, age_seconds=2 * 3600, force_hours=0).reap is True
+
+
+def test_force_timeout_reason_is_readable():
+    assert reason_text(REASON_FORCE_TIMEOUT) == "满时限未完成（强制清理）"
+
+
+def test_compose_notify_explains_mixed_delete_file_rules():
+    """
+    普通规则不删文件、强制规则删文件时，通知要说明口径而不是笼统写「否」。
+    """
+    plain = compose_notify(
+        watched=[], removed=["a"], watched_total=0, blacklist_total=0, delete_files=False
+    )
+    assert plain.text.startswith("【已删除】1 个任务（删除文件：否）")
+    mixed = compose_notify(
+        watched=[], removed=["a"], watched_total=0, blacklist_total=0,
+        delete_files=False, force_delete=True,
+    )
+    assert "按规则（强制超时任务连本地文件删）" in mixed.text
+
+
+def test_default_config_enables_force_timeout_with_file_deletion():
+    """
+    满 24H 强制清理默认开启，且默认连本地文件一起删。
+    """
+    assert DEFAULT_CONFIG["force_timeout"] is True
+    assert DEFAULT_CONFIG["force_hours"] == 24
+    assert DEFAULT_CONFIG["force_delete_files"] is True
+    normalized = normalize_config({"force_hours": 0, "force_delete_files": "false"})
+    assert normalized["force_hours"] == 1
+    assert normalized["force_delete_files"] is False
+    assert normalized["force_timeout"] is True

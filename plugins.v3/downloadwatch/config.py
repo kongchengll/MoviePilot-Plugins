@@ -34,6 +34,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_hours": 24,
     # 进度阈值（百分比）：小于等于该值才可能被判为卡死
     "min_progress": 5,
+    # 强制清理：任务从首次被监控起满 force_hours 小时仍未下载完成就删除，不看进度
+    "force_timeout": True,
+    # 强制清理的时长阈值（小时）
+    "force_hours": 24,
+    # 强制清理时是否连本地文件一起删，不受 delete_files 影响
+    "force_delete_files": True,
     # 只监控带这些标签的任务，留空表示不按标签过滤
     "tags": "",
     # 删除任务时是否同时删除已下载文件
@@ -99,6 +105,11 @@ def normalize_config(config: Optional[Mapping[str, Any]]) -> dict[str, Any]:
 
     result["max_hours"] = _as_int(raw.get("max_hours"), DEFAULT_CONFIG["max_hours"], 1, 8760)
     result["min_progress"] = _as_int(raw.get("min_progress"), DEFAULT_CONFIG["min_progress"], 0, 99)
+    result["force_timeout"] = _as_bool(raw.get("force_timeout"), DEFAULT_CONFIG["force_timeout"])
+    result["force_hours"] = _as_int(raw.get("force_hours"), DEFAULT_CONFIG["force_hours"], 1, 8760)
+    result["force_delete_files"] = _as_bool(
+        raw.get("force_delete_files"), DEFAULT_CONFIG["force_delete_files"]
+    )
     result["tags"] = str(raw.get("tags") or "").strip()
 
     result["delete_files"] = _as_bool(raw.get("delete_files"), DEFAULT_CONFIG["delete_files"])

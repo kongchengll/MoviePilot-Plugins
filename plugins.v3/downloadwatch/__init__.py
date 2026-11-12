@@ -1,9 +1,10 @@
 """
 下载监控插件主入口。
 
-职责：按配置周期扫描下载器中「正在下载」的任务，把「已等待时长 ≥ X 小时且进度 ≤ Y%」
-的任务判定为卡死，删除任务（可选连文件一起删），并把该种子记入本地黑名单；黑名单里的
-种子再次被订阅下载时会被立即清理，从而避免同一个坏种子反复占用下载位。
+职责：按配置周期扫描下载器中「正在下载」的任务，两条规则任一命中即清理：
+①「已等待时长 ≥ X 小时且进度 ≤ Y%」的卡死任务；②监控满 24 小时仍未下载完成的
+任务（默认连本地文件一起删）。删除后把该种子记入本地黑名单；黑名单里的种子再次被
+订阅下载时会被立即清理，从而避免同一个坏种子反复占用下载位。
 
 删除任务时按下载历史定位对应订阅，把该集从订阅的「已下载进度」里撤回，否则宿主会认为
 这一集已经下过、之后永远不再搜索新的种子。可选地再把种子标题追加进订阅排除规则，
@@ -49,8 +50,10 @@ from .config import (
 )
 from .monitor import (
     REASON_BLACKLIST,
+    REASON_FORCE_TIMEOUT,
     compose_notify,
     evaluate,
+    evaluate_force,
     format_duration,
     format_size,
     is_downloading,
@@ -105,6 +108,9 @@ class StatusData(BaseModel):
     enabled: bool = Field(default=False, description="插件是否启用")
     max_hours: int = Field(default=0, description="等待时长阈值（小时）")
     min_progress: int = Field(default=0, description="进度阈值（百分比）")
+    force_timeout: bool = Field(default=True, description="是否开启满时限强制清理")
+    force_hours: int = Field(default=24, description="强制清理时长阈值（小时）")
+    force_delete_files: bool = Field(default=True, description="强制清理时是否删除本地文件")
     tags: List[str] = Field(default_factory=list, description="监控标签")
     blacklist: int = Field(default=0, description="黑名单条目数")
     watched: int = Field(default=0, description="当前监控中的任务数")
@@ -119,9 +125,9 @@ class DownloadWatch(_PluginBase):
     """
 
     plugin_name = "下载监控"
-    plugin_desc = "定时扫描正在下载的任务，等待超过设定时长且进度仍低于阈值的自动删除；删除时回滚订阅已下载进度并拉黑种子，让订阅重新搜索其它种子。"
+    plugin_desc = "定时扫描正在下载的任务：超时且进度停滞，或监控满 24 小时仍未完成，都会自动删除（后者默认连本地文件一起删）；删除时回滚订阅进度并拉黑种子，让订阅重新搜索其它种子。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "1.5.0"
+    plugin_version = "1.6.0"
     plugin_label = "下载,清理"
     plugin_author = "kongchengll"
     plugin_config_prefix = "downloadwatch_"
@@ -162,8 +168,9 @@ class DownloadWatch(_PluginBase):
         if not self._cron_valid:
             logger.error(f"下载监控：cron 表达式非法 {self._config.get('cron')}，定时扫描不会生效")
         logger.info(
-            "下载监控：已启用，判定条件为等待 ≥ "
+            "下载监控：已启用，卡死规则为等待 ≥ "
             f"{self._config.get('max_hours')} 小时且进度 ≤ {self._config.get('min_progress')}%，"
+            f"强制清理：{'满 ' + str(self._config.get('force_hours')) + ' 小时未完成即删' if self._config.get('force_timeout') else '关'}，"
             f"扫描周期 {self._config.get('cron')}"
         )
         self._schedule_once()
@@ -240,6 +247,9 @@ class DownloadWatch(_PluginBase):
         wanted_tags = split_tags(self._config.get("tags"))
         max_hours = int(self._config.get("max_hours") or 24)
         min_progress = int(self._config.get("min_progress") or 0)
+        force_timeout = bool(self._config.get("force_timeout"))
+        force_hours = int(self._config.get("force_hours") or 24)
+        force_delete_files = bool(self._config.get("force_delete_files"))
         use_blacklist = bool(self._config.get("use_blacklist"))
         delete_files = bool(self._config.get("delete_files"))
         dry_run = bool(self._config.get("dry_run"))
@@ -249,6 +259,8 @@ class DownloadWatch(_PluginBase):
         downloading_total = 0
         detail: List[str] = []
         removed = 0
+        # 本轮由「满时限未完成」规则实际清理的任务数，用于说明删除文件的口径
+        force_removed = 0
         waiting = 0
         # 本轮新进入监控的任务描述，以及详情页用的监控中快照
         watch_events: List[str] = []
@@ -303,45 +315,68 @@ class DownloadWatch(_PluginBase):
 
             if use_blacklist and torrent_hash in black_hashes:
                 reason = REASON_BLACKLIST
+                item_delete_files = delete_files
             else:
                 if not tags_match(tags_text, wanted_tags):
                     # 标签不匹配的任务不参与判定，但保留观察计时
                     continue
-                decision = evaluate(
-                    progress=progress,
-                    age_seconds=age_seconds,
-                    max_hours=max_hours,
-                    min_progress=min_progress,
-                )
-                if not decision.reap:
-                    watch_rows.append(
-                        self._watch_row(
-                            title=title,
-                            progress=progress,
-                            age_seconds=age_seconds,
-                            size=size,
-                            tags=tags_text,
-                            downloader=downloader,
-                            speed=speed,
-                            first_ts=record.get("ts") if record else now,
-                        )
+                # 先判「满时限未完成」：这条规则不看进度，命中后按自己的开关删本地文件，
+                # 优先级高于卡死规则，避免同一个任务被算成两条原因
+                force_decision = (
+                    evaluate_force(
+                        progress=progress,
+                        age_seconds=age_seconds,
+                        force_hours=force_hours,
                     )
-                    if is_new:
-                        watch_events.append(
-                            self._describe(torrent, title, progress, age_seconds, decision.reason)
+                    if force_timeout
+                    else None
+                )
+                if force_decision and force_decision.reap:
+                    reason = REASON_FORCE_TIMEOUT
+                    item_delete_files = True if force_delete_files else delete_files
+                else:
+                    decision = evaluate(
+                        progress=progress,
+                        age_seconds=age_seconds,
+                        max_hours=max_hours,
+                        min_progress=min_progress,
+                    )
+                    if not decision.reap:
+                        watch_rows.append(
+                            self._watch_row(
+                                title=title,
+                                progress=progress,
+                                age_seconds=age_seconds,
+                                size=size,
+                                tags=tags_text,
+                                downloader=downloader,
+                                speed=speed,
+                                first_ts=record.get("ts") if record else now,
+                            )
                         )
-                    continue
-                reason = decision.reason
+                        if is_new:
+                            watch_events.append(
+                                self._describe(torrent, title, progress, age_seconds, decision.reason)
+                            )
+                        continue
+                    reason = decision.reason
+                    item_delete_files = delete_files
 
             label = self._describe(torrent, title, progress, age_seconds, reason)
+            if reason == REASON_FORCE_TIMEOUT and item_delete_files:
+                label += " · 连本地文件一起删"
             if dry_run:
                 detail.append(f"{label}（演练模式，未删除）")
                 continue
 
-            if not self._remove(chain, torrent_hash, getattr(torrent, "downloader", None), delete_files):
+            if not self._remove(
+                chain, torrent_hash, getattr(torrent, "downloader", None), item_delete_files
+            ):
                 continue
 
             removed += 1
+            if reason == REASON_FORCE_TIMEOUT:
+                force_removed += 1
             first_seen.pop(torrent_hash, None)
             if use_blacklist:
                 # 同一个种子被反复下载时只保留最新一条，否则列表里会堆出一串同名记录
@@ -380,7 +415,7 @@ class DownloadWatch(_PluginBase):
                     reason=reason,
                     size=size,
                     downloader=downloader,
-                    delete_files=delete_files,
+                    delete_files=item_delete_files,
                     removed_at=stamp,
                     note=note,
                 )
@@ -411,6 +446,7 @@ class DownloadWatch(_PluginBase):
             message=message,
             scanned=len(torrents),
             removed=removed,
+            force_removed=force_removed,
             waiting=waiting,
             blacklist=len(blacklist),
             dry_run=dry_run,
@@ -428,6 +464,7 @@ class DownloadWatch(_PluginBase):
             watched_total=len(watch_rows),
             blacklist_total=len(blacklist),
             delete_files=delete_files,
+            force_delete=bool(force_removed),
             dry_run=dry_run,
         )
         return summary
@@ -441,7 +478,8 @@ class DownloadWatch(_PluginBase):
         watched_total: int,
         blacklist_total: int,
         delete_files: bool,
-        dry_run: bool,
+        force_delete: bool = False,
+        dry_run: bool = False,
     ) -> None:
         """
         按开关发送「新增监控 + 已删除」通知。
@@ -455,6 +493,7 @@ class DownloadWatch(_PluginBase):
         :param watched_total: 当前监控中任务数
         :param blacklist_total: 黑名单条目数
         :param delete_files: 删除任务时是否连文件一起删
+        :param force_delete: 本轮是否有按强制时限清理且连文件删除的任务
         :param dry_run: 是否处于演练模式
         """
         if notify is None:
@@ -473,6 +512,7 @@ class DownloadWatch(_PluginBase):
             blacklist_total=blacklist_total,
             delete_files=delete_files,
             limit=MAX_NOTIFY_LINES,
+            force_delete=force_delete,
         )
         if draft is None:
             return
@@ -746,7 +786,9 @@ class DownloadWatch(_PluginBase):
         parts.append(f"进度 {progress_text(progress)}")
         if age_seconds is not None:
             parts.append(f"已等待 {format_duration(age_seconds)}")
-        if reason == REASON_BLACKLIST:
+        if reason == REASON_FORCE_TIMEOUT:
+            parts.append("满时限未完成，强制清理")
+        elif reason == REASON_BLACKLIST:
             parts.append("命中黑名单")
         downloader = str(getattr(torrent, "downloader", "") or "")
         if downloader:
@@ -950,6 +992,8 @@ class DownloadWatch(_PluginBase):
         text = (
             f"插件状态：{'已启用' if status and status.enabled else '未启用'}\n"
             f"判定条件：等待 ≥ {status.max_hours if status else 0} 小时且进度 ≤ {status.min_progress if status else 0}%\n"
+            f"强制清理：{'满 ' + str(status.force_hours if status else 24) + ' 小时未完成即删' if status and status.force_timeout else '关'}"
+            f"{'（连本地文件）' if status and status.force_timeout and status.force_delete_files else ''}\n"
             f"监控中：{status.watched if status else 0} 个　已删除：{status.removed if status else 0} 条\n"
             f"黑名单：{status.blacklist if status else 0} 条\n"
             f"最近扫描：{status.last_scan if status and status.last_scan else '尚未扫描'}\n"
@@ -1087,6 +1131,9 @@ class DownloadWatch(_PluginBase):
                 enabled=self._enabled,
                 max_hours=int(self._config.get("max_hours") or 0),
                 min_progress=int(self._config.get("min_progress") or 0),
+                force_timeout=bool(self._config.get("force_timeout")),
+                force_hours=int(self._config.get("force_hours") or 24),
+                force_delete_files=bool(self._config.get("force_delete_files")),
                 tags=split_tags(self._config.get("tags")),
                 blacklist=len(state["blacklist"]),
                 watched=len(records.get("watched") or []),
@@ -1234,6 +1281,43 @@ class DownloadWatch(_PluginBase):
                         "component": "VRow",
                         "content": [
                             self._col(
+                                3,
+                                [
+                                    self._switch(
+                                        "force_timeout",
+                                        "满 24H 强制清理",
+                                        "监控满设定小时仍未下载完成就直接删除，不再看进度阈值",
+                                    )
+                                ],
+                            ),
+                            self._col(
+                                3,
+                                [
+                                    self._text(
+                                        "force_hours",
+                                        "强制清理时长（小时）",
+                                        "默认 24 小时，从插件首次监控到该任务开始计时",
+                                        type="number",
+                                    )
+                                ],
+                            ),
+                            self._col(
+                                6,
+                                [
+                                    self._switch(
+                                        "force_delete_files",
+                                        "强制清理时删除本地文件",
+                                        "只作用于这条规则：删除下载任务时连已下载文件一起删，"
+                                        "不受上方「同时删除文件」开关影响，且不可恢复。",
+                                    )
+                                ],
+                            ),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self._col(
                                 6,
                                 [
                                     self._text(
@@ -1261,12 +1345,14 @@ class DownloadWatch(_PluginBase):
                     {
                         "component": "VAlert",
                         "props": {
-                            "type": "info",
+                            "type": "warning",
                             "variant": "tonal",
-                            "title": "判定说明",
-                            "text": "同时满足「已等待 ≥ 等待时长阈值」与「进度 ≤ 进度阈值」才会删除；"
-                                    "已完成或做种中的任务永不处理。下载器不提供任务添加时间，"
-                                    "等待时长按插件首次观测到该任务的时间计算。",
+                            "title": "判定说明（两条规则任一命中即清理）",
+                            "text": "规则一：同时满足「已等待 ≥ 等待时长阈值」与「进度 ≤ 进度阈值」判为卡死。"
+                                    "规则二：监控满强制清理时长（默认 24 小时）仍未下载完成，直接删除任务，"
+                                    "默认连本地文件一起删，不看进度、不可恢复。"
+                                    "两条规则都只作用于正在下载且标签命中的任务；已完成/做种中的任务永不处理。"
+                                    "下载器不提供任务添加时间，计时按插件首次观测到该任务的时间计算。",
                         },
                     },
                 ],
@@ -1462,9 +1548,14 @@ class DownloadWatch(_PluginBase):
                   else ("仅删除" if self._config.get("notify_remove") else "关"))
         )
         yes_no = lambda flag: "是" if self._config.get(flag) else "否"
+        force_on = bool(self._config.get("force_timeout"))
+        force_chip = f"满 {self._config.get('force_hours')}H 强制清理 {'开' if force_on else '关'}"
+        if force_on and self._config.get("force_delete_files"):
+            force_chip += "（连文件删）"
         chips = [
             self._chip(f"等待 ≥ {self._config.get('max_hours')} 小时", "primary", True),
             self._chip(f"进度 ≤ {self._config.get('min_progress')}%", "primary", True),
+            self._chip(force_chip, "error"),
             self._chip(f"标签 {'、'.join(tags) if tags else '全部任务'}"),
             self._chip(f"周期 {self._config.get('cron')}"),
             self._chip(f"删除文件 {yes_no('delete_files')}"),
