@@ -15,6 +15,9 @@ DEFAULT_CRON = "*/10 * * * *"
 # 黑名单保留上限，避免长期运行后数据无限增长
 MAX_BLACKLIST = 500
 
+# 换源计数保留上限，按「订阅 + 集」记录，超出后裁掉最旧的
+MAX_SWAPS = 200
+
 # 详情页「已删除」记录保留条数
 MAX_REMOVED_RECORDS = 100
 
@@ -54,8 +57,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "dry_run": False,
     # 删除后写入本地黑名单，任务再次出现时立即清理
     "use_blacklist": True,
-    # 删除后把种子标题追加到对应订阅的排除规则
-    "sync_subscribe": False,
+    # 删除后把种子标题写进订阅排除规则，让宿主改搜其它种子（换源）
+    "sync_subscribe": True,
+    # 同一订阅同一集最多自动换源几次，0 表示不限制
+    "swap_limit": 5,
     # 保存配置后立即扫描一次
     "once": False,
 }
@@ -64,6 +69,9 @@ _SEASON_PATTERN = re.compile(r"[Ss](\d{1,2})")
 
 # 集号文本：支持 E01、E01-E03、E01、E02 等宿主下载历史与种子标题里的常见写法
 _EPISODE_PATTERN = re.compile(r"[Ee](\d{1,4})(?:\s*[-~]\s*[Ee]?(\d{1,4}))?")
+
+# 订阅排除规则里未转义的 `|` 才是分支分隔符，`\|` 属于分支内容
+_EXCLUDE_SPLIT = re.compile(r"(?<!\\)\|")
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -119,6 +127,7 @@ def normalize_config(config: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     result["dry_run"] = _as_bool(raw.get("dry_run"), DEFAULT_CONFIG["dry_run"])
     result["use_blacklist"] = _as_bool(raw.get("use_blacklist"), DEFAULT_CONFIG["use_blacklist"])
     result["sync_subscribe"] = _as_bool(raw.get("sync_subscribe"), DEFAULT_CONFIG["sync_subscribe"])
+    result["swap_limit"] = _as_int(raw.get("swap_limit"), DEFAULT_CONFIG["swap_limit"], 0, 50)
     result["once"] = _as_bool(raw.get("once"), False)
     return result
 
@@ -189,15 +198,71 @@ def merge_exclude(existing: Any, keyword: Any) -> str:
     :return: 合并后的排除规则串；无变化时返回原值
     """
     current = str(existing or "").strip().rstrip("|")
-    escaped = escape_regex(keyword)
+    escaped = exclude_rule(keyword)
     if not escaped:
         return current
     if not current:
         return escaped
     # 已经包含同一条规则时保持原样，避免反复保存把规则串越拼越长
-    if escaped in {part.strip() for part in current.split("|")}:
+    if escaped in {part.strip() for part in _EXCLUDE_SPLIT.split(current)}:
         return current
     return f"{current}|{escaped}"
+
+
+def exclude_rule(title: Any) -> str:
+    """
+    把种子标题转成可安全嵌入订阅排除正则的一个分支。
+
+    标题里带 `[`、`(`、`+` 等正则元字符时，直接拼进排除规则会被当成语法，
+    轻则误排除整部剧，重则正则编译失败导致该订阅搜索全挂，所以统一转义。
+
+    :param title: 种子原始标题
+    :return: 转义后的排除分支
+    """
+    return escape_regex(title)
+
+
+def remove_exclude_rule(existing: Any, rule: Any) -> tuple[str, bool]:
+    """
+    从订阅排除规则里删掉指定分支。
+
+    :param existing: 订阅当前的排除规则
+    :param rule: 待移除的分支（通常是 :func:`exclude_rule` 的产物）
+    :return: (新的排除规则, 是否真的删掉了分支)
+    """
+    current = str(existing or "").strip()
+    target = str(rule or "").strip()
+    if not current or not target:
+        return current, False
+    parts = _EXCLUDE_SPLIT.split(current)
+    kept = [part for part in parts if part.strip() and part.strip() != target]
+    if len(kept) == len([part for part in parts if part.strip()]):
+        return current, False
+    return "|".join(part.strip() for part in kept), True
+
+
+def swap_allowed(count: Any, limit: Any) -> bool:
+    """
+    判断同一订阅同一集是否还允许继续自动换源。
+
+    换源上限是防死循环的兜底：所有可选种子都卡住时，插件每轮删一个、宿主每轮
+    重下一个，会把下载器刷爆，所以超过上限后改为放弃该集并提示人工处理。
+
+    :param count: 该集已经换源的次数
+    :param limit: 上限；0 或负数表示不限制
+    :return: 是否允许继续换源
+    """
+    try:
+        maximum = int(limit or 0)
+    except (TypeError, ValueError):
+        maximum = 0
+    if maximum <= 0:
+        return True
+    try:
+        used = int(count or 0)
+    except (TypeError, ValueError):
+        used = 0
+    return used < maximum
 
 
 def remove_blacklist_item(

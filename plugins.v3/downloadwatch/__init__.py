@@ -38,14 +38,18 @@ from .config import (
     MAX_LIST_ROWS,
     MAX_NOTIFY_LINES,
     MAX_REMOVED_RECORDS,
+    MAX_SWAPS,
     MAX_WATCH_RECORDS,
+    exclude_rule,
     merge_exclude,
     normalize_config,
     normalize_title,
     parse_episodes,
     parse_season,
     remove_blacklist_item,
+    remove_exclude_rule,
     split_tags,
+    swap_allowed,
     tags_match,
 )
 from .monitor import (
@@ -112,6 +116,8 @@ class StatusData(BaseModel):
     force_hours: int = Field(default=24, description="强制清理时长阈值（小时）")
     force_delete_files: bool = Field(default=True, description="强制清理时是否删除本地文件")
     tags: List[str] = Field(default_factory=list, description="监控标签")
+    sync_subscribe: bool = Field(default=True, description="是否写入订阅排除规则（换源）")
+    swap_limit: int = Field(default=5, description="同一集最多自动换源次数，0 表示不限")
     blacklist: int = Field(default=0, description="黑名单条目数")
     watched: int = Field(default=0, description="当前监控中的任务数")
     removed: int = Field(default=0, description="已删除记录条数")
@@ -125,9 +131,9 @@ class DownloadWatch(_PluginBase):
     """
 
     plugin_name = "下载监控"
-    plugin_desc = "定时扫描正在下载的任务：超时且进度停滞，或监控满 24 小时仍未完成，都会自动删除（后者默认连本地文件一起删）；删除时回滚订阅进度并拉黑种子，让订阅重新搜索其它种子。"
+    plugin_desc = "定时扫描正在下载的任务：超时且进度停滞，或监控满 24 小时仍未完成，都会自动删除（后者默认连本地文件一起删）；删除时把种子写进订阅排除规则，让宿主改搜其它站点的同集种子，并回滚订阅进度。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "1.6.0"
+    plugin_version = "1.7.0"
     plugin_label = "下载,清理"
     plugin_author = "kongchengll"
     plugin_config_prefix = "downloadwatch_"
@@ -148,6 +154,8 @@ class DownloadWatch(_PluginBase):
         self._records: Dict[str, List[Dict[str, Any]]] = {"watched": [], "removed": []}
         # 详情页当前选中的分页
         self._page_tab = _DEFAULT_TAB
+        # 「订阅:集数」到换源次数的映射，用于限制同一集反复换源
+        self._swaps: Dict[str, Dict[str, Any]] = {}
 
     def init_plugin(self, config: Optional[Dict[str, Any]] = None) -> None:
         """
@@ -242,6 +250,7 @@ class DownloadWatch(_PluginBase):
         state = self._load_state()
         first_seen: Dict[str, Dict[str, Any]] = state["first_seen"]
         blacklist: List[Dict[str, Any]] = state["blacklist"]
+        self._swaps = state["swaps"]
         black_hashes = {str(item.get("hash") or "").lower() for item in blacklist}
 
         wanted_tags = split_tags(self._config.get("tags"))
@@ -369,6 +378,8 @@ class DownloadWatch(_PluginBase):
                 detail.append(f"{label}（演练模式，未删除）")
                 continue
 
+            # 删除前先判定这是不是「已经被否决过的种子」，收尾时要区别对待
+            already_blacklisted = use_blacklist and torrent_hash in black_hashes
             if not self._remove(
                 chain, torrent_hash, getattr(torrent, "downloader", None), item_delete_files
             ):
@@ -378,6 +389,10 @@ class DownloadWatch(_PluginBase):
             if reason == REASON_FORCE_TIMEOUT:
                 force_removed += 1
             first_seen.pop(torrent_hash, None)
+            # 收尾：写订阅排除规则（让宿主换源）＋回滚订阅进度，顺序不能反
+            note, extra = self._release_task(
+                torrent, title, torrent_hash, already_blacklisted=already_blacklisted
+            )
             if use_blacklist:
                 # 同一个种子被反复下载时只保留最新一条，否则列表里会堆出一串同名记录
                 blacklist = [
@@ -385,26 +400,17 @@ class DownloadWatch(_PluginBase):
                     for item in blacklist
                     if str(item.get("hash") or "").strip().lower() != torrent_hash
                 ]
-                blacklist.append(
-                    {
-                        "hash": torrent_hash,
-                        "title": title,
-                        "downloader": downloader,
-                        "removed_at": stamp,
-                        "reason": reason,
-                    }
-                )
+                entry: Dict[str, Any] = {
+                    "hash": torrent_hash,
+                    "title": title,
+                    "downloader": downloader,
+                    "removed_at": stamp,
+                    "reason": reason,
+                }
+                entry.update(extra)
+                blacklist.append(entry)
                 black_hashes.add(torrent_hash)
 
-            note = ""
-            # 删除任务后必须先回收订阅进度：宿主在提交下载时就写入了订阅的「已下载集数」，
-            # 不回滚的话订阅会认为该集已完成，之后无论重新订阅还是刷新都不会再搜这一集
-            history = self._load_download_history(torrent_hash)
-            progress_note = self._rollback_subscribe(history, title)
-            exclude_note = ""
-            if self._config.get("sync_subscribe"):
-                exclude_note = self._sync_subscribe_exclude(torrent, title, history)
-            note = "；".join(part for part in (progress_note, exclude_note) if part)
             detail.append(f"{label}{'｜' + note if note else ''}")
             remove_events.append(label)
             remove_rows.append(
@@ -425,9 +431,18 @@ class DownloadWatch(_PluginBase):
         first_seen = {key: value for key, value in first_seen.items() if key in alive}
         if len(blacklist) > MAX_BLACKLIST:
             blacklist = blacklist[-MAX_BLACKLIST:]
+        if len(self._swaps) > MAX_SWAPS:
+            # 换源计数按最近使用时间裁剪，避免长期积累
+            ordered = sorted(
+                self._swaps.items(),
+                key=lambda item: int(item[1].get("ts") or 0),
+            )
+            self._swaps = dict(ordered[-MAX_SWAPS:])
         # 「仍在观察」与详情页表格口径保持一致：标签命中的未完成任务
         waiting = len(watch_rows)
-        self._save_state({"first_seen": first_seen, "blacklist": blacklist})
+        self._save_state(
+            {"first_seen": first_seen, "blacklist": blacklist, "swaps": self._swaps}
+        )
 
         # 监控中快照按本轮结果整体替换；已删除记录按时间累积，超上限裁掉最旧的
         previous_removed = self._records.get("removed") or []
@@ -659,44 +674,95 @@ class DownloadWatch(_PluginBase):
                 matched = same_season
         return matched
 
-    def _rollback_subscribe(self, history: Optional[Any], title: str) -> str:
+    def _release_task(
+        self,
+        torrent: Any,
+        title: str,
+        torrent_hash: str,
+        *,
+        already_blacklisted: bool = False,
+    ) -> Tuple[str, Dict[str, Any]]:
         """
-        把被删任务覆盖的集数从订阅的已下载进度里撤回。
+        删除任务后的收尾：写订阅排除（换源）→ 回滚订阅进度 → 记一次换源。
 
-        宿主提交下载时就把这些集写进了订阅的 note（以及洗版订阅的 episode_priority），
-        不撤回则订阅认为该集已经下过，永远不会再搜索新的种子。
+        宿主在提交下载时就把集数写进了订阅的 note，不撤回则订阅永远认为这集已经
+        下过（这是「删了之后订阅跳过该集」的根因）；但只撤回不排除，宿主下一轮
+        搜索仍会选中同一个「最优」种子，于是变成「删 → 重下 → 再删」的死循环。
 
-        :param history: 该任务的下载历史，可为 None
-        :param title: 任务标题，历史缺少集数文本时用标题兜底解析
-        :return: 处理结论文本
+        因此这里按固定顺序处理：
+        1. 先把种子标题写进订阅的排除正则：宿主在搜索阶段就会过滤掉它，只能去
+           其它站点/其它发布组找同集种子，这才是真正的「换源」；
+        2. 再撤回订阅进度，让宿主重新搜这一集；
+        3. 给该集记一次换源，超过上限就放弃，避免所有种子都卡住时无限循环。
+
+        :param torrent: 下载任务对象
+        :param title: 已归一化的标题，历史缺集数时用来兜底解析
+        :param torrent_hash: 任务 hash
+        :param already_blacklisted: 该 hash 是否早已在黑名单里（说明是重复下载）
+        :return: (处理结论文本, 需要并入黑名单条目的附加字段)
         """
+        history = self._load_download_history(torrent_hash)
         if not history:
-            return "无下载历史，未回滚订阅进度"
+            return "无下载历史，未回滚订阅进度", {}
+        if already_blacklisted:
+            # 已被否决过的种子又出现了：这次不再回滚进度。
+            # 回滚只会让宿主再搜一次、再选中它一次，把死循环续下去；保留「已下载」
+            # 标记才是真正能止住循环的做法，这一集等人工介入。
+            return "该种子已在黑名单，跳过重复回滚以避免宿主反复重下", {}
+
         media_source = str(getattr(history, "media_source", "") or "")
         media_id = str(getattr(history, "media_id", "") or "")
         mtype = str(getattr(history, "type", "") or "")
         if not media_source or not media_id or not mtype:
-            return "下载历史缺少媒体标识，未回滚订阅进度"
+            return "下载历史缺少媒体标识，未回滚订阅进度", {}
 
         season = parse_season(getattr(history, "seasons", None))
         subscriptions = self._match_subscriptions(media_source, media_id, mtype, season)
         if not subscriptions:
-            return "未找到对应订阅，未回滚订阅进度"
+            return "未找到对应订阅，未回滚订阅进度", {}
         if len(subscriptions) > 1:
-            return f"匹配到 {len(subscriptions)} 个订阅，未回滚订阅进度"
+            return f"匹配到 {len(subscriptions)} 个订阅，未回滚订阅进度", {}
 
         subscribe = subscriptions[0]
         episodes = parse_episodes(getattr(history, "episodes", None)) or parse_episodes(title)
         note = [int(item) for item in (getattr(subscribe, "note", None) or []) if str(item).isdigit()]
         if mtype == MediaType.TV.value:
             if not episodes:
-                return "无法确定被删任务的集数，未回滚订阅进度"
+                return "无法确定被删任务的集数，未回滚订阅进度", {}
             targets = set(episodes)
         else:
             # 电影与音乐只有一项，插件删除任务即视为该项未完成
             targets = set(note)
 
+        subscribe_name = str(getattr(subscribe, "name", "") or "未命名订阅")
+        swap_key = f"{getattr(subscribe, 'id', '')}:{','.join(str(item) for item in sorted(targets))}"
+        used = int((self._swaps.get(swap_key) or {}).get("count") or 0)
+        extra: Dict[str, Any] = {
+            "subscribe_id": getattr(subscribe, "id", None),
+            "subscribe_name": subscribe_name,
+            "swap_key": swap_key,
+            "episodes": ",".join(str(item) for item in sorted(targets)),
+        }
+        if not swap_allowed(used, self._config.get("swap_limit")):
+            logger.warning(
+                f"下载监控：《{subscribe_name}》第 {sorted(targets)} 集已换源 {used} 次仍未下成，放弃自动换源"
+            )
+            return (
+                f"《{subscribe_name}》该集已自动换源 {used} 次仍未下成，"
+                "已停止换源并保留「已下载」标记，请人工处理",
+                extra,
+            )
+
         payload: Dict[str, Any] = {}
+        raw_title = str(getattr(torrent, "title", "") or title)
+        rule = ""
+        if self._config.get("sync_subscribe"):
+            rule = exclude_rule(raw_title)
+            current = str(getattr(subscribe, "exclude", None) or "").strip().rstrip("|")
+            merged = merge_exclude(current, raw_title)
+            if rule and merged != current:
+                payload["exclude"] = merged
+
         new_note = [episode for episode in note if episode not in targets]
         if new_note != note:
             payload["note"] = new_note
@@ -707,13 +773,13 @@ class DownloadWatch(_PluginBase):
             if kept != priority:
                 payload["episode_priority"] = kept
         if not payload:
-            return f"订阅《{subscribe.name}》未记录该集，无需回滚"
+            return f"订阅《{subscribe_name}》未记录该集，无需回滚", extra
 
         try:
             SubscribeOper().update(subscribe.id, payload)
         except Exception as error:  # noqa: BLE001 - 写失败需要显式告知用户
-            logger.warning(f"下载监控：回滚订阅进度失败：{error}")
-            return "回滚订阅进度失败"
+            logger.warning(f"下载监控：更新订阅失败：{error}")
+            return "写入订阅排除/回滚进度失败", {}
 
         # 进度回滚后这份下载历史已无对应任务，顺手删掉，避免订阅详情继续显示已下载文件
         history_id = getattr(history, "id", None)
@@ -722,51 +788,60 @@ class DownloadWatch(_PluginBase):
                 DownloadHistoryOper().delete_history(int(history_id))
             except Exception as error:  # noqa: BLE001 - 历史清理失败不影响进度回滚
                 logger.warning(f"下载监控：删除下载历史失败：{error}")
+
+        self._swaps[swap_key] = {
+            "count": used + 1,
+            "ts": int(time.time()),
+            "title": title,
+            "subscribe": subscribe_name,
+            "episodes": extra["episodes"],
+        }
+        parts: List[str] = []
+        if "exclude" in payload:
+            parts.append(f"已写入订阅《{subscribe_name}》排除规则，宿主将改搜其它站点种子")
+            extra["exclude_rule"] = rule
+        if "note" in payload or "episode_priority" in payload:
+            parts.append(f"回滚 {len(targets)} 集进度")
         logger.info(
-            f"下载监控：已从订阅《{subscribe.name}》回滚 {sorted(targets)} 的下载进度"
+            f"下载监控：{title} 已换源（第 {used + 1} 次）｜{('；'.join(parts)) or '无变更'}"
         )
-        return f"已回滚订阅《{subscribe.name}》的 {len(targets)} 集进度"
+        return ("；".join(parts) or f"订阅《{subscribe_name}》未记录该集", extra)
 
-    def _sync_subscribe_exclude(self, torrent: Any, title: str, history: Optional[Any]) -> str:
+    def _drop_exclude(self, item: Dict[str, Any]) -> str:
         """
-        把种子标题追加到匹配订阅的排除规则，阻止再次订阅时选中同一个种子。
+        移除黑名单条目时，同步把它写进订阅排除正则的分支删掉。
 
-        只有在能唯一定位到订阅时才写入，宁可跳过也不批量改用户配置。
+        只从本地黑名单里删掉是没用的：宿主的搜索阶段仍在按排除规则过滤这个种子，
+        表现就是「移除了但还是不下」。这里连订阅配置一起还原。
 
-        :param torrent: 下载任务对象
-        :param title: 已归一化的标题，仅用于兜底匹配
-        :param history: 该任务的下载历史，可为 None
-        :return: 处理结论文本
+        :param item: 被移除的黑名单条目
+        :return: 处理结论文本；无需处理时返回空串
         """
-        if not history:
-            return "无下载历史，未同步排除规则"
-        media_source = str(getattr(history, "media_source", "") or "")
-        media_id = str(getattr(history, "media_id", "") or "")
-        mtype = str(getattr(history, "type", "") or "")
-        if not media_source or not media_id or not mtype:
-            return "下载历史缺少媒体标识，未同步排除规则"
-
-        season = parse_season(getattr(history, "seasons", None)) or parse_season(
-            getattr(torrent, "season_episode", None)
-        )
-        matched = self._match_subscriptions(media_source, media_id, mtype, season)
-        if not matched:
-            return "未找到对应订阅，仅保留本地黑名单"
-        if len(matched) > 1:
-            return f"匹配到 {len(matched)} 个订阅，未自动修改排除规则"
-
-        subscribe = matched[0]
-        current = subscribe.exclude or ""
-        merged = merge_exclude(current, getattr(torrent, "title", "") or title)
-        if merged == current.strip().rstrip("|"):
-            return f"订阅《{subscribe.name}》已包含该排除规则"
+        rule = str(item.get("exclude_rule") or "").strip()
+        subscribe_id = item.get("subscribe_id")
+        if not rule or subscribe_id in (None, ""):
+            return ""
         try:
-            SubscribeOper().update(subscribe.id, {"exclude": merged})
-        except Exception as error:  # noqa: BLE001 - 写配置失败需要显式告知用户
-            logger.warning(f"下载监控：写入订阅排除规则失败：{error}")
-            return "写入订阅排除规则失败"
-        logger.info(f"下载监控：已把种子标题写入订阅《{subscribe.name}》的排除规则")
-        return f"已写入订阅《{subscribe.name}》排除规则"
+            subscribe = SubscribeOper().get(int(subscribe_id))
+        except Exception as error:  # noqa: BLE001 - 订阅不可读时只记录
+            logger.warning(f"下载监控：读取订阅失败，跳过撤销排除规则：{error}")
+            return ""
+        if not subscribe:
+            return ""
+        merged, removed = remove_exclude_rule(getattr(subscribe, "exclude", None), rule)
+        if not removed:
+            return ""
+        try:
+            SubscribeOper().update(int(subscribe_id), {"exclude": merged})
+        except Exception as error:  # noqa: BLE001 - 写失败需要显式告知用户
+            logger.warning(f"下载监控：撤销订阅排除规则失败：{error}")
+            return ""
+        # 该条目对应的换源计数一并清掉，让它重新获得完整的换源次数
+        swap_key = str(item.get("swap_key") or "").strip()
+        if swap_key:
+            self._swaps.pop(swap_key, None)
+        logger.info(f"下载监控：已从订阅《{getattr(subscribe, 'name', '')}》撤销排除规则")
+        return "已撤销订阅排除规则"
 
     @staticmethod
     def _describe(
@@ -869,7 +944,7 @@ class DownloadWatch(_PluginBase):
 
     def _load_state(self) -> Dict[str, Any]:
         """
-        读取观察表与黑名单，异常结构按空处理。
+        读取观察表、黑名单与换源计数，异常结构按空处理。
         """
         try:
             raw = self.get_data(_STATE_KEY)
@@ -879,14 +954,17 @@ class DownloadWatch(_PluginBase):
         state = raw if isinstance(raw, dict) else {}
         first_seen = state.get("first_seen")
         blacklist = state.get("blacklist")
+        swaps = state.get("swaps")
         return {
             "first_seen": dict(first_seen) if isinstance(first_seen, dict) else {},
             "blacklist": [item for item in blacklist if isinstance(item, dict)] if isinstance(blacklist, list) else [],
+            "swaps": {str(key): dict(value) for key, value in swaps.items() if isinstance(value, dict)}
+            if isinstance(swaps, dict) else {},
         }
 
     def _save_state(self, state: Dict[str, Any]) -> None:
         """
-        持久化观察表与黑名单。
+        持久化观察表、黑名单与换源计数。
         """
         try:
             self.save_data(_STATE_KEY, state)
@@ -1072,6 +1150,7 @@ class DownloadWatch(_PluginBase):
         :return: 宿主统一响应结构
         """
         state = self._load_state()
+        self._swaps = state["swaps"]
         current = len(state["blacklist"])
         if not str(hash or "").strip() and not str(title or "").strip():
             return schemas.Response(
@@ -1086,13 +1165,24 @@ class DownloadWatch(_PluginBase):
                 message="黑名单里已经没有这条记录，可能刚被移除",
                 data={"removed": 0, "blacklist": len(kept)},
             )
-        self._save_state({"first_seen": state["first_seen"], "blacklist": kept})
+        # 同步撤销写进订阅的排除规则，否则宿主搜索阶段依旧过滤这个种子
+        drop_note = next((text for text in (self._drop_exclude(item) for item in removed) if text), "")
+        self._save_state(
+            {"first_seen": state["first_seen"], "blacklist": kept, "swaps": self._swaps}
+        )
         name = str(removed[0].get("title") or removed[0].get("hash") or "未知种子")
         logger.info(f"下载监控：已手动移除黑名单条目「{name}」，剩余 {len(kept)} 条")
+        message = f"已移除「{name}」，剩余 {len(kept)} 条"
+        if drop_note:
+            message += f"；{drop_note}"
         return schemas.Response(
             success=True,
-            message=f"已移除「{name}」，剩余 {len(kept)} 条",
-            data={"removed": len(removed), "blacklist": len(kept)},
+            message=message,
+            data={
+                "removed": len(removed),
+                "blacklist": len(kept),
+                "exclude_removed": bool(drop_note),
+            },
         )
 
     def api_scan_now(self) -> "schemas.Response[ScanResultData]":
@@ -1135,6 +1225,8 @@ class DownloadWatch(_PluginBase):
                 force_hours=int(self._config.get("force_hours") or 24),
                 force_delete_files=bool(self._config.get("force_delete_files")),
                 tags=split_tags(self._config.get("tags")),
+                sync_subscribe=bool(self._config.get("sync_subscribe")),
+                swap_limit=int(self._config.get("swap_limit") or 0),
                 blacklist=len(state["blacklist"]),
                 watched=len(records.get("watched") or []),
                 removed=len(records.get("removed") or []),
@@ -1330,17 +1422,46 @@ class DownloadWatch(_PluginBase):
                             self._col(
                                 6,
                                 [
-                                    self._switch(
-                                        "sync_subscribe",
-                                        "写入订阅排除规则",
-                                        "可选：把整个种子标题写进订阅排除正则。副作用是同一标题的"
-                                        "其它种子（含其它站点）也会被排除，若该剧只有这一个版本，"
-                                        "这一集将一直下不到；删除后回滚订阅进度是本插件默认行为，"
-                                        "不依赖该开关。",
+                                    self._text(
+                                        "swap_limit",
+                                        "同一集最多换源次数",
+                                        "默认 5 次，0 表示不限制；超过后停止换源并保留「已下载」标记，"
+                                        "避免所有种子都卡住时反复删了又下",
+                                        type="number",
                                     )
                                 ],
                             ),
                         ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self._col(
+                                12,
+                                [
+                                    self._switch(
+                                        "sync_subscribe",
+                                        "删除后写入订阅排除规则（换源）",
+                                        "默认开启，这是让宿主改下其它种子的关键：删除时把该种子标题写进对应订阅的"
+                                        "「排除」正则，宿主搜索阶段就会过滤掉它，转而去找其它站点/其它发布组的同集"
+                                        "种子。关闭后宿主会一直重下同一个「最优」种子，插件只能反复删除。",
+                                    )
+                                ],
+                            ),
+                        ],
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "class": "mb-2",
+                            "title": "换源是怎么生效的",
+                            "text": "宿主的订阅进度（note）记录着「哪些集已经下过」，不撤回它就不会再搜这一集；"
+                                    "但只撤回不排除，下一轮搜索又会选中同一个种子。插件因此按顺序处理："
+                                    "先把种子标题写进订阅排除规则 → 再撤回订阅进度 → 宿主重新搜索时只能选到其它种子。"
+                                    "在「黑名单」里点「移除」会同时撤销这条排除规则，让该种子重新可选。",
+                        },
                     },
                     {
                         "component": "VAlert",
@@ -1516,7 +1637,8 @@ class DownloadWatch(_PluginBase):
             ]
             return (
                 rows,
-                "黑名单为空。删除过任务并开启「删除后拉黑」后，被删的种子会记录在这里。",
+                "黑名单为空。删除过任务并开启「删除后拉黑」后，被删的种子会记录在这里，"
+                "同时它会被写进订阅的排除规则，让宿主改下别的种子。",
                 "info",
             )
         dry_run = bool(self._config.get("dry_run"))
@@ -1552,6 +1674,11 @@ class DownloadWatch(_PluginBase):
         force_chip = f"满 {self._config.get('force_hours')}H 强制清理 {'开' if force_on else '关'}"
         if force_on and self._config.get("force_delete_files"):
             force_chip += "（连文件删）"
+        swap_on = bool(self._config.get("sync_subscribe"))
+        swap_chip = f"换源 {'开' if swap_on else '关'}"
+        if swap_on:
+            limit = int(self._config.get("swap_limit") or 0)
+            swap_chip += f"（上限 {limit} 次）" if limit > 0 else "（不限次）"
         chips = [
             self._chip(f"等待 ≥ {self._config.get('max_hours')} 小时", "primary", True),
             self._chip(f"进度 ≤ {self._config.get('min_progress')}%", "primary", True),
@@ -1561,11 +1688,13 @@ class DownloadWatch(_PluginBase):
             self._chip(f"删除文件 {yes_no('delete_files')}"),
             self._chip(f"演练 {yes_no('dry_run')}"),
             self._chip(f"拉黑 {yes_no('use_blacklist')}"),
+            self._chip(swap_chip, "success" if swap_on else "warning"),
             self._chip(f"通知 {notify_state}"),
         ]
         note = (
-            "删除任务时自动回滚订阅进度并重新搜索该集（固定开启）"
-            f"　·　写入订阅排除：{'开' if self._config.get('sync_subscribe') else '关'}"
+            "删除后：写入订阅排除规则（换源）→ 回滚订阅进度 → 宿主改搜其它站点的同集种子"
+            if swap_on
+            else "删除后只回滚订阅进度，宿主可能重下同一个种子，建议开启「换源」"
         )
         return {
             "component": "VCard",
@@ -1721,7 +1850,8 @@ class DownloadWatch(_PluginBase):
             "content": [
                 {
                     "component": "span",
-                    "text": "提示：点条目右侧的「移除」即可删掉这条拉黑记录；移除后该种子再出现不会再被自动删除。",
+                    "text": "提示：点条目右侧的「移除」会同时撤销它写进订阅的排除规则，"
+                            "该种子重新可选、该集的换源次数也会清零。",
                 },
             ],
         }
@@ -1888,6 +2018,12 @@ class DownloadWatch(_PluginBase):
         downloader = str(item.get("downloader") or "").strip()
         if downloader:
             parts.append(f"下载器 {downloader}")
+        subscribe_name = str(item.get("subscribe_name") or "").strip()
+        if subscribe_name:
+            episodes = str(item.get("episodes") or "").strip()
+            parts.append(f"订阅 {subscribe_name}" + (f" E{episodes}" if episodes else ""))
+        if str(item.get("exclude_rule") or "").strip():
+            parts.append("已写订阅排除（换源）")
         return parts
 
     def stop_service(self) -> None:

@@ -6,16 +6,21 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from app.plugins.downloadwatch.config import (
     DEFAULT_CONFIG,
+    exclude_rule,
     merge_exclude,
     normalize_config,
     parse_episodes,
     parse_season,
     remove_blacklist_item,
+    remove_exclude_rule,
     split_tags,
+    swap_allowed,
     tags_match,
     task_tags,
 )
@@ -470,3 +475,73 @@ def test_default_config_enables_force_timeout_with_file_deletion():
     assert normalized["force_hours"] == 1
     assert normalized["force_delete_files"] is False
     assert normalized["force_timeout"] is True
+
+
+def test_default_config_enables_swap_on_remove():
+    """
+    「删除后换源」默认开启：不写订阅排除，宿主就会一直重下同一个种子。
+    """
+    assert DEFAULT_CONFIG["sync_subscribe"] is True
+    assert DEFAULT_CONFIG["swap_limit"] == 5
+    normalized = normalize_config({"sync_subscribe": "false", "swap_limit": 99})
+    assert normalized["sync_subscribe"] is False
+    assert normalized["swap_limit"] == 50
+    # 0 表示不限制，不能被下限抬成 1
+    assert normalize_config({"swap_limit": 0})["swap_limit"] == 0
+
+
+def test_exclude_rule_escapes_regex_metacharacters():
+    """
+    种子标题里的方括号、加号必须转义，否则排除正则要么误杀整部剧、要么编译失败。
+    """
+    rule = exclude_rule("[ANi] Some Show - 01 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4")
+    assert rule.startswith(r"\[ANi\]")
+    assert re.fullmatch(rule, "[ANi] Some Show - 01 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4")
+    assert exclude_rule("") == ""
+
+
+def test_remove_exclude_rule_drops_only_target_branch():
+    """
+    移除黑名单时要精确删掉自己写入的分支，不能顺手清空用户原有规则。
+    """
+    merged = merge_exclude("用户规则A|用户规则B", "Bad.Release.1080p")
+    rule = exclude_rule("Bad.Release.1080p")
+    restored, removed = remove_exclude_rule(merged, rule)
+    assert removed is True
+    assert restored == "用户规则A|用户规则B"
+
+
+def test_remove_exclude_rule_keeps_escaped_pipe():
+    """
+    分支内部转义过的 `\\|` 不是分隔符，拆分时不能把它切开。
+    """
+    rule = exclude_rule("A|B")
+    existing = merge_exclude("", "A|B")
+    assert rule == existing
+    merged = merge_exclude(existing, "Other")
+    restored, removed = remove_exclude_rule(merged, rule)
+    assert removed is True
+    assert restored == exclude_rule("Other")
+
+
+def test_remove_exclude_rule_noop_cases():
+    """
+    规则不存在、参数为空时保持原值，避免误清空订阅排除。
+    """
+    assert remove_exclude_rule("", "x") == ("", False)
+    assert remove_exclude_rule("AAA", "") == ("AAA", False)
+    assert remove_exclude_rule("AAA|BBB", "CCC") == ("AAA|BBB", False)
+
+
+def test_swap_allowed_respects_limit():
+    """
+    换源次数达到上限后必须停止，避免所有种子都卡住时无限删了又下。
+    """
+    assert swap_allowed(0, 5) is True
+    assert swap_allowed(4, 5) is True
+    assert swap_allowed(5, 5) is False
+    assert swap_allowed(99, 5) is False
+    # 0 / 负数 / 非法值都表示不限制
+    assert swap_allowed(99, 0) is True
+    assert swap_allowed(99, -1) is True
+    assert swap_allowed(99, "abc") is True
