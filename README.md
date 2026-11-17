@@ -10,6 +10,8 @@ MoviePilot V3 插件合集（个人维护）：
   支持自定义 cron、三种统计窗口（昨日 / 今日 / 最近 24 小时）、电视剧与电影分别筛选、
   排除关键词；也可在消息渠道发送 `/digest_push` 随时手动触发一次。
 
+  ![日报效果图](plugins.v3/dailyepisodedigest/images/preview.jpg)
+
   详见 [插件说明](plugins.v3/dailyepisodedigest/README.md)。
 
 ### [下载监控](https://github.com/kongchengll/MoviePilot-Plugins/tree/main/plugins.v3/downloadwatch)
