@@ -39,6 +39,11 @@ class EpisodeGroup:
     episodes: list[int] = field(default_factory=list)
     last_time: str = ""
     poster: Optional[str] = None
+    # 当前季总集数，来自订阅匹配；未匹配到时为 None，卡片只显示当前集数
+    total_episodes: Optional[int] = None
+    # 媒体身份，优先用于与订阅精确匹配
+    media_source: Optional[str] = None
+    media_id: Optional[str] = None
 
     @property
     def is_movie(self) -> bool:
@@ -46,6 +51,15 @@ class EpisodeGroup:
         该分组是否为电影。
         """
         return self.media_type == _MOVIE_TYPE
+
+    @property
+    def current_episode(self) -> Optional[int]:
+        """
+        本次入库的最大集号，作为「当前集数」；电影或无集号时返回 None。
+        """
+        if self.is_movie or not self.episodes:
+            return None
+        return max(self.episodes)
 
     @property
     def episode_count(self) -> int:
@@ -244,6 +258,8 @@ def build_digest(
                 category=str(record.get("category") or "").strip() or None,
                 year=str(record.get("year") or "").strip() or None,
                 last_time=record_time,
+                media_source=str(record.get("media_source") or "").strip() or None,
+                media_id=str(record.get("media_id") or "").strip() or None,
             )
             merged[key] = group
         if not group.is_movie:
@@ -267,6 +283,94 @@ def build_digest(
         groups=ordered,
         dropped=dropped,
     )
+
+
+def _normalize_title(text: Optional[str]) -> str:
+    """
+    标题归一化：去空白与常见标点、统一小写，用于订阅与整理历史的标题匹配。
+    """
+    raw = str(text or "").casefold()
+    return re.sub(r"[\s\-_:：·・.,，。!！?？()（）\[\]【】]+", "", raw)
+
+
+def _season_index(raw: Any) -> Optional[int]:
+    """
+    从季号字段提取数字季号，订阅为 int、整理历史为 `S01` 文本，统一为整数。
+    """
+    matched = re.search(r"\d{1,3}", str(raw or ""))
+    return int(matched.group()) if matched else None
+
+
+def _subscription_total(subscription: Mapping[str, Any]) -> Optional[int]:
+    """
+    取订阅里的当前季总集数，手动指定值优先于宿主维护值。
+    """
+    for key in ("manual_total_episode", "total_episode"):
+        try:
+            value = int(subscription.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def attach_subscription_totals(
+    digest: Digest,
+    subscriptions: Iterable[Mapping[str, Any]],
+) -> int:
+    """
+    把订阅里的当前季总集数匹配到各剧集分组，写入 `group.total_episodes`。
+
+    匹配优先级：媒体身份（数据源+原生 ID）精确匹配 > 归一化标题+季号；
+    同一分组已被更高优先级填上时不覆盖。电影不参与匹配。
+
+    :param digest: 待补充总集数的摘要
+    :param subscriptions: 订阅字典列表，含 name/season/total_episode 等字段
+    :return: 成功匹配到总集数的剧集数量
+    """
+    by_identity: dict[tuple[str, str], int] = {}
+    by_title_season: dict[tuple[str, int], int] = {}
+    for subscription in subscriptions:
+        total = _subscription_total(subscription)
+        if total is None:
+            continue
+        source = str(subscription.get("media_source") or "").strip().casefold()
+        media_id = str(subscription.get("media_id") or "").strip()
+        if source and media_id and media_id != "0":
+            by_identity.setdefault((source, media_id), total)
+        title = _normalize_title(subscription.get("name"))
+        season = _season_index(subscription.get("season"))
+        if title and season is not None:
+            by_title_season.setdefault((title, season), total)
+
+    matched = 0
+    for group in digest.groups:
+        if group.is_movie or group.current_episode is None:
+            continue
+        total: Optional[int] = None
+        if group.media_source and group.media_id:
+            total = by_identity.get((group.media_source.casefold(), group.media_id))
+        if total is None:
+            total = by_title_season.get((_normalize_title(group.title), _season_index(group.season)))
+        if total is not None:
+            group.total_episodes = total
+            matched += 1
+    return matched
+
+
+def episode_progress(group: EpisodeGroup) -> str:
+    """
+    单部剧的集数进度文本，如 `28/32`（有总集数）或 `28`（未匹配到订阅）。
+
+    电影与无集号的剧集返回空串，调用方据此决定是否绘制徽标。
+    """
+    current = group.current_episode
+    if current is None:
+        return ""
+    if group.total_episodes and group.total_episodes > 0:
+        return f"{current}/{group.total_episodes}"
+    return str(current)
 
 
 def group_detail(group: EpisodeGroup) -> str:
@@ -317,7 +421,9 @@ def render(digest: Digest, empty_hint: str = "没有新入库内容") -> tuple[s
 
     lines: list[str] = [_summary_line(digest), ""]
     for index, group in enumerate(digest.groups, start=1):
-        lines.append(f"{index}. {group.title}")
+        progress = episode_progress(group)
+        suffix = f"  [{progress}]" if progress else ""
+        lines.append(f"{index}. {group.title}{suffix}")
         lines.append(f"   {group_detail(group)}")
     if digest.dropped:
         lines.append("")

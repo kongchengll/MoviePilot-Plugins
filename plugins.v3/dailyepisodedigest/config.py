@@ -52,6 +52,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "boxoffice_items": 5,
     # 有图片时只发图片：不带通知标题、不带正文，手动触发成功也不回执行结果
     "image_only": True,
+    # 剧名后显示「当前集数/订阅总集数」进度徽标
+    "show_episode_progress": True,
 }
 
 _TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -121,6 +123,9 @@ def normalize_config(config: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     result["show_boxoffice"] = _as_bool(raw.get("show_boxoffice"), DEFAULT_CONFIG["show_boxoffice"])
     result["boxoffice_items"] = _as_int(raw.get("boxoffice_items"), DEFAULT_CONFIG["boxoffice_items"], 1, 10)
     result["image_only"] = _as_bool(raw.get("image_only"), DEFAULT_CONFIG["image_only"])
+    result["show_episode_progress"] = _as_bool(
+        raw.get("show_episode_progress"), DEFAULT_CONFIG["show_episode_progress"]
+    )
     return result
 
 

@@ -19,7 +19,7 @@ from typing import Any, Optional
 from app.sdk.logging import logger
 
 from .boxoffice import BoxOfficeData
-from .digest import Digest, EpisodeGroup, format_episodes, short_time
+from .digest import Digest, EpisodeGroup, episode_progress, format_episodes, short_time
 from .fonts import FontBook
 
 # 画布宽度固定为 1080，主流渠道展示时不会被压缩到看不清文字
@@ -227,6 +227,43 @@ def _bold(draw: Any, xy: tuple[float, float], text: str, font: Any, fill: tuple[
     draw.text(xy, text, font=font, fill=fill, anchor=anchor, stroke_width=1, stroke_fill=fill)
 
 
+def _progress_badge_width(draw: Any, text: str, font: Any) -> int:
+    """
+    计算集数进度徽标的宽度，供标题截断时预留空间。
+    """
+    if not text:
+        return 0
+    return int(draw.textlength(text, font=font)) + 26
+
+
+def _draw_progress_badge(
+    draw: Any,
+    left: int,
+    center_y: int,
+    text: str,
+    font: Any,
+    *,
+    matched: bool,
+) -> None:
+    """
+    在剧名右侧绘制「28/32」进度徽标；匹配到订阅时高亮，仅当前集数时用暗色。
+    """
+    if not text:
+        return
+    width = _progress_badge_width(draw, text, font)
+    height = 32
+    top = center_y - height // 2
+    color = _CYAN if matched else _MUTED
+    draw.rounded_rectangle(
+        (left, top, left + width, top + height),
+        radius=height // 2,
+        fill=_tint(color, 0.22),
+        outline=_tint(color, 0.5),
+        width=1,
+    )
+    draw.text((left + width / 2, center_y + 1), text, font=font, fill=color, anchor="mm")
+
+
 def _parse_moment(raw: str) -> Optional[datetime]:
     """
     解析宿主时间字符串，失败返回 None。
@@ -388,9 +425,10 @@ def _draw_row(
     index: int,
     top: int,
     font_book: FontBook,
+    show_progress: bool = True,
 ) -> None:
     """
-    单行作品卡片：海报、序号、标题、类型/季/集数标签、集号、分类年份、入库时间。
+    单行作品卡片：海报、序号、标题（可跟集数进度徽标）、类型/季/集数标签、集号、分类年份、入库时间。
     """
     _panel(draw, (_PAD, top, _WIDTH - _PAD, top + _ROW_HEIGHT))
 
@@ -417,13 +455,29 @@ def _draw_row(
     text_width = text_right - text_x
 
     font_name = font_book.get(36)
+    font_badge = font_book.get(22)
+    progress = episode_progress(group) if show_progress else ""
+    badge_width = _progress_badge_width(draw, progress, font_badge)
+    title_width = text_width - badge_width - 14 if badge_width else text_width
     _bold(
         draw,
         (text_x, top + 48),
-        _ellipsize(draw, group.title, font_name, text_width),
+        _ellipsize(draw, group.title, font_name, title_width),
         font_name,
         _TEXT,
     )
+    if progress:
+        title_end = text_x + draw.textlength(
+            _ellipsize(draw, group.title, font_name, title_width), font=font_name
+        )
+        _draw_progress_badge(
+            draw,
+            int(title_end) + 12,
+            top + 48,
+            progress,
+            font_badge,
+            matched=group.total_episodes is not None,
+        )
 
     # 胶囊标签：类型、季、集数 / 年份
     font_chip = font_book.get(20)
@@ -577,6 +631,7 @@ def render_card(
     target: Path,
     max_rows: int = _MAX_ROWS,
     boxoffice: Optional[BoxOfficeData] = None,
+    show_progress: bool = True,
 ) -> Optional[Path]:
     """
     绘制日报卡片并保存为 JPEG。
@@ -586,6 +641,7 @@ def render_card(
     :param target: 输出文件路径
     :param max_rows: 卡片内最多列出几部，超出部分在底部汇总提示
     :param boxoffice: 可选的猫眼实时票房数据
+    :param show_progress: 是否在剧名后显示集数进度徽标
     :return: 成功时返回输出路径，否则返回 None
     """
     try:
@@ -621,7 +677,11 @@ def render_card(
             _draw_listhead(draw, digest, top, font_book)
         elif name == "rows":
             for index, group in enumerate(rows):
-                _draw_row(draw, canvas, group, index + 1, top + index * (_ROW_HEIGHT + _ROW_GAP), font_book)
+                _draw_row(
+                    draw, canvas, group, index + 1,
+                    top + index * (_ROW_HEIGHT + _ROW_GAP), font_book,
+                    show_progress=show_progress,
+                )
         elif name == "hidden":
             _draw_hidden(draw, hidden, top, font_book)
         elif name == "boxoffice" and boxoffice:

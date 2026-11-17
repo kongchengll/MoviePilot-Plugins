@@ -20,7 +20,9 @@ from app.plugins.dailyepisodedigest.config import (
     split_words,
 )
 from app.plugins.dailyepisodedigest.digest import (
+    attach_subscription_totals,
     build_digest,
+    episode_progress,
     format_episodes,
     parse_episodes,
     render,
@@ -255,3 +257,95 @@ def test_parse_window_alias(raw, expected):
     命令参数应能映射到统计窗口，无法识别时返回 None 表示沿用配置。
     """
     assert parse_window_alias(raw) == expected
+
+
+def _digest_with_shows():
+    """
+    构造一部 S01 剧集（本批入库到 E14）供进度匹配测试。
+    """
+    return build_digest(
+        [_record(episodes="E13-E14")],
+        start=DAY_START,
+        end=DAY_END,
+        day_label="10月23日",
+    )
+
+
+def test_subscription_total_manual_wins():
+    """
+    手动指定的总集数应优先于宿主维护值。
+    """
+    digest = _digest_with_shows()
+    matched = attach_subscription_totals(
+        digest,
+        [{"name": "漫长的季节", "season": 1, "total_episode": 12, "manual_total_episode": 35}],
+    )
+    assert matched == 1
+    assert digest.groups[0].total_episodes == 35
+    assert episode_progress(digest.groups[0]) == "14/35"
+
+
+def test_subscription_total_by_title_and_season():
+    """
+    归一化标题（含空格标点）加季号应能匹配，季号不一致时不匹配。
+    """
+    digest = _digest_with_shows()
+    attach_subscription_totals(
+        digest,
+        [{"name": " 漫长的季节 ", "season": 1, "total_episode": 30}],
+    )
+    assert digest.groups[0].total_episodes == 30
+
+    other = _digest_with_shows()
+    attach_subscription_totals(
+        other,
+        [{"name": "漫长的季节", "season": 2, "total_episode": 30}],
+    )
+    assert other.groups[0].total_episodes is None
+    assert episode_progress(other.groups[0]) == "14"
+
+
+def test_subscription_total_by_media_identity():
+    """
+    标题不同但媒体身份一致时，仍应通过身份精确匹配到总集数。
+    """
+    digest = build_digest(
+        [_record(title="译名A", media_source="douban", media_id="3600001")],
+        start=DAY_START,
+        end=DAY_END,
+        day_label="10月23日",
+    )
+    attach_subscription_totals(
+        digest,
+        [{
+            "name": "原名B", "season": 1, "total_episode": 28,
+            "media_source": "douban", "media_id": "3600001",
+        }],
+    )
+    assert digest.groups[0].total_episodes == 28
+
+
+def test_episode_progress_skips_movies_and_empty():
+    """
+    电影与无集号剧集不显示进度徽标。
+    """
+    digest = build_digest(
+        [
+            _record(title="沙丘2", type="电影", seasons=None, episodes=None),
+            _record(title="无集号剧", episodes=""),
+        ],
+        start=DAY_START,
+        end=DAY_END,
+        day_label="10月23日",
+    )
+    assert all(episode_progress(group) == "" for group in digest.groups)
+
+
+def test_render_shows_progress_when_matched():
+    """
+    正文在匹配到订阅后应在剧名后标注进度。
+    """
+    digest = _digest_with_shows()
+    attach_subscription_totals(digest, [{"name": "漫长的季节", "season": 1, "total_episode": 32}])
+    _, text = render(digest)
+    assert "1. 漫长的季节  [14/32]" in text

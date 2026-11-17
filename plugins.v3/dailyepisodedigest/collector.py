@@ -16,6 +16,7 @@ from app.sdk.queries import (
     QuerySortDirection,
     QuerySortField,
     TransferHistoryFilter,
+    list_subscriptions,
     list_transfer_history,
 )
 
@@ -23,6 +24,8 @@ from app.sdk.queries import (
 _PAGE_SIZE = 200
 # 单次推送最多翻页数，避免异常数据导致长时间占用调度线程
 _MAX_PAGES = 50
+# 订阅总量通常远小于整理历史，单独设一个更小的翻页上限
+_MAX_SUB_PAGES = 10
 
 _TYPE_MAP = {
     "电视剧": MediaType.TV,
@@ -40,6 +43,9 @@ def _to_record(snapshot: Any) -> dict[str, Any]:
         "type": getattr(snapshot, "type", None),
         "category": getattr(snapshot, "category", None),
         "year": getattr(snapshot, "year", None),
+        # 媒体身份供与订阅做精确匹配，缺失时降级为标题+季匹配
+        "media_source": getattr(snapshot, "media_source", None),
+        "media_id": getattr(snapshot, "media_id", None),
         "seasons": getattr(snapshot, "seasons", None),
         "episodes": getattr(snapshot, "episodes", None),
         "date": getattr(snapshot, "date", None),
@@ -99,3 +105,48 @@ def fetch_records(start: str, end: str, media_types: Iterable[str]) -> list[dict
 
     logger.debug(f"每日入库速报：窗口 {start} ~ {end} 命中 {len(records)} 条整理记录")
     return records
+
+
+def _to_subscription(snapshot: Any) -> dict[str, Any]:
+    """
+    把订阅只读快照投影成纯字典，只保留匹配总集数所需的字段。
+    """
+    return {
+        "name": getattr(snapshot, "name", None),
+        "year": getattr(snapshot, "year", None),
+        "season": getattr(snapshot, "season", None),
+        "total_episode": getattr(snapshot, "total_episode", None),
+        "manual_total_episode": getattr(snapshot, "manual_total_episode", None),
+        "media_source": getattr(snapshot, "media_source", None),
+        "media_id": getattr(snapshot, "media_id", None),
+    }
+
+
+def fetch_subscriptions() -> list[dict[str, Any]]:
+    """
+    读取全部订阅快照，用于把「当前季总集数」匹配到入库剧集。
+
+    注解快照的 total_episode 由宿主维护，manual_total_episode 为用户手动指定，
+    后者优先使用。查询失败时返回空列表，让日报降级为不显示总集数而不是中断推送。
+
+    :return: 投影后的订阅字典列表
+    """
+    try:
+        sort = QuerySort(field=QuerySortField.ID, direction=QuerySortDirection.ASC)
+        subscriptions: list[dict[str, Any]] = []
+        for page in range(1, _MAX_SUB_PAGES + 1):
+            result = list_subscriptions(page=QueryPageRequest(page=page, count=_PAGE_SIZE, sort=sort))
+            items = list(getattr(result, "items", []) or [])
+            if not items:
+                break
+            subscriptions.extend(_to_subscription(snapshot) for snapshot in items)
+            total = int(getattr(result, "total", 0) or 0)
+            if page * _PAGE_SIZE >= total:
+                break
+        else:
+            logger.warning(f"每日入库速报：订阅翻页超过 {_MAX_SUB_PAGES} 页，已截断总集数匹配")
+        logger.debug(f"每日入库速报：读取 {len(subscriptions)} 条订阅用于总集数匹配")
+        return subscriptions
+    except Exception as error:  # noqa: BLE001 - 订阅查询失败不应中断日报
+        logger.warning(f"每日入库速报：读取订阅失败，本次不显示总集数：{error}")
+        return []

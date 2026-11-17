@@ -28,7 +28,7 @@ from app.sdk.plugin import _PluginBase
 
 from .boxoffice import fetch_boxoffice
 from .card import prune_old_cards, render_card
-from .collector import fetch_records
+from .collector import fetch_records, fetch_subscriptions
 from .config import (
     DEFAULT_CONFIG,
     MEDIA_TYPE_OPTIONS,
@@ -39,7 +39,7 @@ from .config import (
     resolve_window,
     split_words,
 )
-from .digest import Digest, build_digest, render
+from .digest import Digest, attach_subscription_totals, build_digest, render
 from .fonts import FontBook, locate_font, resolve_font
 
 # 卡片文件名格式，同时用于校验接口入参，杜绝路径穿越
@@ -77,7 +77,7 @@ class DailyEpisodeDigest(_PluginBase):
     plugin_name = "每日入库速报"
     plugin_desc = "定时统计每天新入库的剧集与电影，渲染成带封面的日报长图，通过 MoviePilot 通知渠道推送。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.6.2"
+    plugin_version = "2.6.3"
     plugin_label = "媒体库,通知"
     plugin_author = "kongchengll"
     plugin_config_prefix = "dailyepisodedigest_"
@@ -618,6 +618,10 @@ class DailyEpisodeDigest(_PluginBase):
                             ),
                             self._col(
                                 3,
+                                [self._switch("show_episode_progress", "剧名后显示集数进度")],
+                            ),
+                            self._col(
+                                6,
                                 [
                                     {
                                         "component": "VTextField",
@@ -671,6 +675,8 @@ class DailyEpisodeDigest(_PluginBase):
                                         "手动触发：/digest_push，也可使用配置的「自定义触发词」直接触发推送，"
                                         "支持 /digest_push today 或 24h 临时切换统计范围。"
                                         "开启「图片追加票房」后，日报末尾会展示猫眼实时票房榜单。"
+                                        "开启「剧名后显示集数进度」后，每部剧名后会标注「当前集/订阅总集」，"
+                                        "总集数取自 MoviePilot 订阅（手动指定优先），未订阅的剧只显示当前集数。"
                                         "日报图片以链接形式交给渠道，插件会依次实测「外网访问地址 → 宿主域名 → 容器内地址」，"
                                         "取第一个可访问的；外网地址解析不了时会回退到容器内地址，"
                                         "此时 Telegram、微信能正常收图，钉钉、飞书这类由客户端拉图的渠道会看不到图。"
@@ -816,6 +822,10 @@ class DailyEpisodeDigest(_PluginBase):
             f"每日入库速报：{day_label} 窗口内命中 {len(records)} 条整理记录，"
             f"聚合为 {digest.total_shows} 部 / {digest.total_episodes} 集"
         )
+        # 剧名后的「当前/总集数」进度：从订阅里取当前季总集数并匹配
+        if self._config.get("show_episode_progress") and not digest.is_empty:
+            matched = attach_subscription_totals(digest, fetch_subscriptions())
+            logger.debug(f"每日入库速报：{matched} 部剧集匹配到订阅总集数")
         summary: Dict[str, Any] = {
             "label": day_label,
             "shows": digest.total_shows,
@@ -890,6 +900,7 @@ class DailyEpisodeDigest(_PluginBase):
             digest, font_book, target,
             max_rows=int(self._config.get("image_items") or 8),
             boxoffice=boxoffice,
+            show_progress=bool(self._config.get("show_episode_progress")),
         ):
             logger.warning("每日入库速报：日报图片生成失败，本次降级为纯文本推送")
             return None, None
