@@ -555,8 +555,9 @@ def _draw_upcoming(
         font=font_book.get(20), fill=_DIM, anchor="rm",
     )
 
-    inner_left = _PAD + 14
-    inner_right = _WIDTH - _PAD - 14
+    # 与「入库明细」卡片同宽同边距，避免两个区块左右边缘错开
+    inner_left = _PAD
+    inner_right = _WIDTH - _PAD
     y = top + _UPCOMING_TITLE_HEIGHT
     font_name = font_book.get(24)
     font_meta = font_book.get(20)
@@ -569,7 +570,7 @@ def _draw_upcoming(
     }
     for update in upcoming:
         _panel(draw, (inner_left, y, inner_right, y + _UPCOMING_CARD_HEIGHT), fill=_PANEL, radius=16)
-        poster_x, poster_y = inner_left + 8, y + (_UPCOMING_CARD_HEIGHT - _UPCOMING_POSTER_H) // 2
+        poster_x, poster_y = inner_left + 14, y + (_UPCOMING_CARD_HEIGHT - _UPCOMING_POSTER_H) // 2
         _paste_small_poster(canvas, update.poster or "", update.title, poster_x, poster_y, font_book)
         draw.rounded_rectangle(
             (poster_x, poster_y, poster_x + _UPCOMING_POSTER_W - 1, poster_y + _UPCOMING_POSTER_H - 1),
@@ -583,22 +584,25 @@ def _draw_upcoming(
         badge_w = int(draw.textlength(badge_text, font=font_status)) + 20 if badge_text else 0
         # 剧名最多两行，右侧为入库状态徽标预留空间
         title_lines = _wrap_two_lines(draw, update.title, font_name, text_width - badge_w - 14)
-        line_y = y + 16
+        two_lines = len(title_lines) > 1
+        line_y = y + (13 if two_lines else 18)
+        line_step = 26 if two_lines else 28
         for line in title_lines:
             _bold(draw, (text_x, line_y), line, font_name, _TEXT, "lm")
-            line_y += 28
+            line_y += line_step
 
         # 第 N 集（对齐原生日历的中文集号口径）
         ep_label = format_episodes_cn(update.episodes)
+        ep_y = y + 70 if two_lines else y + 62
         draw.text(
-            (text_x, y + 62),
+            (text_x, ep_y),
             _ellipsize(draw, ep_label, font_meta, text_width - badge_w - 14),
             font=font_meta, fill=_CYAN, anchor="lm",
         )
 
-        # 最近更新时间（原生日历卡片同样展示）
+        # 最近更新时间（原生日历卡片同样展示）；剧名占两行时让位，避免压到集号
         update_text = short_time(update.last_update) if hasattr(update, "last_update") else ""
-        if update_text:
+        if update_text and not two_lines:
             draw.text((text_x, y + 83), f"最近入库 {update_text}", font=font_meta, fill=_DIM, anchor="lm")
 
         # 入库状态徽标（右侧竖排居中）

@@ -50,11 +50,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 票房区域开关与展示数量
     "show_boxoffice": True,
     "boxoffice_items": 5,
-    # 有图片时只发图片：不带通知标题、不带正文，手动触发成功也不回执行结果
+    # 有图片时只发图片：标题、正文、链接全部不发送，避免渠道在图片下方追加文本条
     "image_only": True,
-    # 通知卡片名称：纯图片模式仍传给渠道作为卡片标题（飞书等会显示在卡片顶部），
-    # 留空则完全不传标题。部分渠道会把标题渲染成图片下方的文本条，可按需清空。
-    "notice_title": "每日入库速报",
+    # 已废弃：历史版本用于给纯图片消息补一个卡片标题，实测飞书会把它渲染成图片
+    # 下方的独立文本条。保留键位只为兼容旧配置，发送逻辑已不再读取。
+    "notice_title": "",
     # 剧名后显示「当前集数/订阅总集数」进度徽标
     "show_episode_progress": True,
     # 昨日入库汇总卡（部数/集数/电影 + 片名速览）
@@ -130,11 +130,8 @@ def normalize_config(config: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     result["show_boxoffice"] = _as_bool(raw.get("show_boxoffice"), DEFAULT_CONFIG["show_boxoffice"])
     result["boxoffice_items"] = _as_int(raw.get("boxoffice_items"), DEFAULT_CONFIG["boxoffice_items"], 1, 10)
     result["image_only"] = _as_bool(raw.get("image_only"), DEFAULT_CONFIG["image_only"])
-    # 卡片名称：为兼容老配置，缺省项缺失时保留默认插件名；显式传空串则清空
-    if "notice_title" in raw:
-        result["notice_title"] = str(raw.get("notice_title") or "").strip()
-    else:
-        result["notice_title"] = DEFAULT_CONFIG["notice_title"]
+    # 兼容旧配置里的通知卡片名称；发送逻辑已不再使用该字段
+    result["notice_title"] = str(raw.get("notice_title") or "").strip()
     result["show_episode_progress"] = _as_bool(
         raw.get("show_episode_progress"), DEFAULT_CONFIG["show_episode_progress"]
     )

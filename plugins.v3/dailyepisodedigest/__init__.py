@@ -84,7 +84,7 @@ class DailyEpisodeDigest(_PluginBase):
     plugin_name = "每日入库速报"
     plugin_desc = "定时统计每天新入库的剧集与电影，渲染成带封面的日报长图，通过 MoviePilot 通知渠道推送。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/statistic.png"
-    plugin_version = "2.7.1"
+    plugin_version = "2.7.2"
     plugin_label = "媒体库,通知"
     plugin_author = "kongchengll"
     plugin_config_prefix = "dailyepisodedigest_"
@@ -659,22 +659,9 @@ class DailyEpisodeDigest(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            self._col(3, [self._switch("image_only", "仅发送图片")]),
+                            self._col(4, [self._switch("image_only", "仅发送图片")]),
                             self._col(
-                                4,
-                                [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "notice_title",
-                                            "label": "通知卡片名称",
-                                            "placeholder": "默认「每日入库速报」，留空则完全不传标题",
-                                        },
-                                    }
-                                ],
-                            ),
-                            self._col(
-                                5,
+                                8,
                                 [
                                     {
                                         "component": "VAlert",
@@ -682,9 +669,9 @@ class DailyEpisodeDigest(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "density": "compact",
-                                            "text": "开启「仅发送图片」后，成功出图时正文与链接都不带；"
-                                            "「通知卡片名称」会显示在飞书等卡片顶部，避免默认的 MoviePilot 字样。"
-                                            "若某渠道把它渲染成图片下方的文本，清空该输入框即可恢复完全纯图片。",
+                                            "text": "开启「仅发送图片」后，成功出图时标题、正文、链接全部不发送，"
+                                            "聊天窗口里只有一张图（飞书等渠道不会在图片下方追加文本条）；"
+                                            "关闭后恢复「标题 + 清单文字 + 图片」的常规推送。",
                                         },
                                     }
                                 ],
@@ -1010,15 +997,13 @@ class DailyEpisodeDigest(_PluginBase):
         """
         通过宿主通知渠道发送消息。
 
-        「仅发送图片」模式下正文与链接都传空，只保留一个简短的「通知卡片名称」
-        （`notice_title`，默认插件名）：飞书等渠道会把它渲染在图片卡片顶部，避免出现
-        默认的 "MoviePilot" 字样；该名称留在卡片内部，不会像正文那样形成图片下方的文本条。
-        若渠道仍把标题渲染成独立文本，可把「通知卡片名称」配置清空以恢复完全纯图片。
+        「仅发送图片」模式下标题、正文、链接全部置空：飞书等渠道会把 title 渲染成
+        图片下方的一条文本，因此这里一律不传，保证聊天窗口里只有一张图。
         无图片时仍发送标题 + 完整清单作为兜底。
         """
         pure_image = bool(image) and bool(self._config.get("image_only", True))
-        send_title = str(self._config.get("notice_title") or "").strip() if pure_image else title
-        send_text = "" if image else text
+        send_title = "" if pure_image else title
+        send_text = "" if pure_image else text
         link = None if pure_image else settings.MP_DOMAIN("#/history")
         try:
             self.post_message(
