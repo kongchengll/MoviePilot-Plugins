@@ -24,6 +24,7 @@ from app.plugins.dailyepisodedigest.digest import (
     build_digest,
     episode_progress,
     format_episodes,
+    format_episodes_cn,
     parse_calendar_updates,
     parse_episodes,
     render,
@@ -420,3 +421,56 @@ def test_normalize_config_new_switches():
     config = normalize_config({"show_yesterday_summary": False, "show_tomorrow_updates": "false"})
     assert config["show_yesterday_summary"] is False
     assert config["show_tomorrow_updates"] is False
+
+
+def test_normalize_config_notice_title():
+    """
+    卡片名称默认插件名，显式留空可恢复完全纯图片。
+    """
+    assert normalize_config(None)["notice_title"] == "每日入库速报"
+    assert normalize_config({"notice_title": "自定义名称"})["notice_title"] == "自定义名称"
+    assert normalize_config({"notice_title": "  "})["notice_title"] == ""
+
+
+def test_format_episodes_cn():
+    """
+    中文集号应合并连续区间，与原生日历口径一致。
+    """
+    assert format_episodes_cn([36, 37, 38, 39, 40]) == "第36-40集"
+    assert format_episodes_cn([1, 3, 5]) == "第1、3、5集"
+    assert format_episodes_cn([7]) == "第7集"
+    assert format_episodes_cn([]) == ""
+
+
+def test_calendar_status_and_last_update():
+    """
+    日历事件应解析最近更新时间，并给出与原UI一致的入库状态文案。
+    """
+    items = [{
+        "date": "2026-11-18",
+        "episodes": [{"episode_number": 9, "name": "深渊回响"}],
+        "subscribe": {
+            "name": "灵笼 第二季", "type": "电视剧", "season": 2,
+            "completed_episode": 8, "total_episode": 16,
+            "last_update": "2026-11-15 20:00:00",
+        },
+    }]
+    update = parse_calendar_updates(items)[0]
+    assert update.last_update == "2026-11-15 20:00:00"
+    assert update.library_status == "部分入库"
+    assert update.progress == "8/16"
+
+    complete = parse_calendar_updates([{
+        "date": "2026-11-18",
+        "episodes": [{"episode_number": 1}],
+        "subscribe": {"name": "完结剧", "type": "电视剧", "season": 1,
+                      "completed_episode": 24, "total_episode": 24},
+    }])[0]
+    assert complete.library_status == "已入库"
+
+    unknown = parse_calendar_updates([{
+        "date": "2026-11-18",
+        "episodes": [{"episode_number": 1}],
+        "subscribe": {"name": "新剧", "type": "电视剧", "season": 1},
+    }])[0]
+    assert unknown.library_status == "待定"

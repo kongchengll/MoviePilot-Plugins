@@ -19,7 +19,7 @@ from typing import Any, Optional
 from app.sdk.logging import logger
 
 from .boxoffice import BoxOfficeData
-from .digest import CalendarUpdate, Digest, EpisodeGroup, episode_progress, format_episodes, short_time
+from .digest import CalendarUpdate, Digest, EpisodeGroup, episode_progress, format_episodes, format_episodes_cn, short_time
 from .fonts import FontBook
 
 # 画布宽度固定为 1080，主流渠道展示时不会被压缩到看不清文字
@@ -201,6 +201,32 @@ def _ellipsize(draw: Any, text: str, font: Any, max_width: int) -> str:
     while trimmed and draw.textlength(trimmed + ellipsis, font=font) > max_width:
         trimmed = trimmed[:-1]
     return (trimmed + ellipsis) if trimmed else ellipsis
+
+
+def _wrap_two_lines(draw: Any, text: str, font: Any, max_width: int) -> list[str]:
+    """
+    按像素宽度把文本折成最多两行，超出部分在第二行末尾省略。
+
+    对齐 MoviePilot 原生日历卡片的剧名展示（`-webkit-line-clamp: 2`）。
+    """
+    if draw.textlength(text, font=font) <= max_width:
+        return [text]
+    lines: list[str] = []
+    current = ""
+    for char in text:
+        if lines and draw.textlength(current + char, font=font) > max_width:
+            # 第一行已满，剩余全部塞进第二行并省略
+            lines.append(current)
+            lines.append(_ellipsize(draw, text[sum(len(line) for line in lines):], font, max_width))
+            return lines[:2]
+        if not lines and draw.textlength(current + char, font=font) > max_width:
+            lines.append(current)
+            current = char
+        else:
+            current += char
+    if current:
+        lines.append(current)
+    return lines[:2]
 
 
 def _panel(draw: Any, box: tuple[int, int, int, int], *, fill: tuple[int, int, int] = _PANEL, radius: int = _PANEL_RADIUS) -> None:
@@ -518,7 +544,8 @@ def _draw_upcoming(
     font_book: FontBook,
 ) -> None:
     """
-    明日更新：小标题 + 每部一张横向卡片（小海报、剧名、季集、本集标题、入库进度）。
+    明日更新：小标题 + 每部一张横向卡片（小海报、剧名最多两行、第N集、入库状态、最近更新）。
+    展示口径对齐 MoviePilot 原生日历卡片：不占用卡面显示本集标题。
     """
     draw.rounded_rectangle((_PAD, top + 10, _PAD + 6, top + 36), radius=3, fill=_PURPLE)
     _bold(draw, (_PAD + 22, top + 23), "明日更新", font_book.get(30), _TEXT)
@@ -531,9 +558,15 @@ def _draw_upcoming(
     inner_left = _PAD + 14
     inner_right = _WIDTH - _PAD - 14
     y = top + _UPCOMING_TITLE_HEIGHT
-    font_name = font_book.get(26)
-    font_meta = font_book.get(21)
-    font_progress = font_book.get(20)
+    font_name = font_book.get(24)
+    font_meta = font_book.get(20)
+    font_status = font_book.get(19)
+    status_colors = {
+        "已入库": _CYAN,
+        "部分入库": _ORANGE,
+        "未入库": _MUTED,
+        "待定": _DIM,
+    }
     for update in upcoming:
         _panel(draw, (inner_left, y, inner_right, y + _UPCOMING_CARD_HEIGHT), fill=_PANEL, radius=16)
         poster_x, poster_y = inner_left + 8, y + (_UPCOMING_CARD_HEIGHT - _UPCOMING_POSTER_H) // 2
@@ -546,37 +579,37 @@ def _draw_upcoming(
         text_x = poster_x + _UPCOMING_POSTER_W + 18
         text_right = inner_right - 16
         text_width = text_right - text_x
-        _bold(
-            draw, (text_x, y + 26),
-            _ellipsize(draw, update.title, font_name, text_width),
-            font_name, _TEXT,
+        badge_text = f"{update.library_status} {update.progress}".strip()
+        badge_w = int(draw.textlength(badge_text, font=font_status)) + 20 if badge_text else 0
+        # 剧名最多两行，右侧为入库状态徽标预留空间
+        title_lines = _wrap_two_lines(draw, update.title, font_name, text_width - badge_w - 14)
+        line_y = y + 16
+        for line in title_lines:
+            _bold(draw, (text_x, line_y), line, font_name, _TEXT, "lm")
+            line_y += 28
+
+        # 第 N 集（对齐原生日历的中文集号口径）
+        ep_label = format_episodes_cn(update.episodes)
+        draw.text(
+            (text_x, y + 62),
+            _ellipsize(draw, ep_label, font_meta, text_width - badge_w - 14),
+            font=font_meta, fill=_CYAN, anchor="lm",
         )
 
-        ep_label = format_episodes(update.episodes)
-        label = f"{update.season} {ep_label}" if update.season and ep_label else (ep_label or "待定")
-        draw.text((text_x, y + 56), _ellipsize(draw, label, font_meta, text_width), font=font_meta, fill=_CYAN, anchor="lm")
+        # 最近更新时间（原生日历卡片同样展示）
+        update_text = short_time(update.last_update) if hasattr(update, "last_update") else ""
+        if update_text:
+            draw.text((text_x, y + 83), f"最近入库 {update_text}", font=font_meta, fill=_DIM, anchor="lm")
 
-        # 本集标题（若有）
-        if update.episode_names:
-            name_line = " / ".join(update.episode_names[:2])
-            draw.text(
-                (text_x, y + 80),
-                _ellipsize(draw, name_line, font_meta, text_width - 140),
-                font=font_meta, fill=_MUTED, anchor="lm",
-            )
-        # 已入库进度徽标
-        if update.progress:
-            badge = f"已入库 {update.progress}"
-            badge_w = int(draw.textlength(badge, font=font_progress)) + 20
-            bx = text_right - badge_w
+        # 入库状态徽标（右侧竖排居中）
+        if badge_text:
+            color = status_colors.get(update.library_status, _MUTED)
+            bx, by = text_right - badge_w, y + 34
             draw.rounded_rectangle(
-                (bx, y + 70, text_right, y + 98), radius=14,
-                fill=_tint(_PURPLE, 0.22),
+                (bx, by, text_right, by + 28), radius=14,
+                fill=_tint(color, 0.20), outline=_tint(color, 0.45), width=1,
             )
-            draw.text(
-                (bx + badge_w / 2, y + 84), badge,
-                font=font_progress, fill=_PURPLE, anchor="mm",
-            )
+            draw.text((bx + badge_w / 2, by + 15), badge_text, font=font_status, fill=color, anchor="mm")
         y += _UPCOMING_CARD_HEIGHT + _UPCOMING_GAP
 
 

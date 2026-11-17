@@ -95,6 +95,7 @@ class CalendarUpdate:
     poster: Optional[str] = None
     completed: Optional[int] = None
     total: Optional[int] = None
+    last_update: str = ""
 
     @property
     def progress(self) -> str:
@@ -106,6 +107,19 @@ class CalendarUpdate:
         if self.total and self.total > 0:
             return f"{self.completed}/{self.total}"
         return str(self.completed)
+
+    @property
+    def library_status(self) -> str:
+        """
+        入库状态文案，对齐原生日历：已入库 / 部分入库 / 未入库 / 待定。
+        """
+        if self.completed is None or self.total is None or self.total <= 0:
+            return "待定"
+        if self.completed >= self.total:
+            return "已入库"
+        if self.completed > 0:
+            return "部分入库"
+        return "未入库"
 
 
 @dataclass
@@ -202,6 +216,30 @@ def format_episodes(numbers: Iterable[int]) -> str:
         start = previous = number
     parts.append(f"E{start:02d}" if start == previous else f"E{start:02d}-E{previous:02d}")
     return "、".join(parts)
+
+
+def format_episodes_cn(numbers: Iterable[int]) -> str:
+    """
+    把集号列表格式化为中文「第 N 集」文本，对齐 MoviePilot 原生日历的展示口径。
+
+    连续集合并成区间，如 `第36-40集`；不连续用顿号，如 `第1、3集`。
+
+    :param numbers: 集号集合
+    :return: 形如 `第36-40集` 的文本，空集返回空串
+    """
+    ordered = sorted({int(number) for number in numbers if int(number) > 0})
+    if not ordered:
+        return ""
+    parts: list[str] = []
+    start = previous = ordered[0]
+    for number in ordered[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        parts.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = number
+    parts.append(str(start) if start == previous else f"{start}-{previous}")
+    return "第" + "、".join(parts) + "集"
 
 
 def _record_time(record: Mapping[str, Any]) -> str:
@@ -463,6 +501,7 @@ def parse_calendar_updates(payload: Any) -> list[CalendarUpdate]:
                 poster=str(subscribe.get("poster") or "").strip() or None,
                 completed=completed,
                 total=total,
+                last_update=str(subscribe.get("last_update") or "").strip(),
             )
             merged[key] = update
         update.episodes = sorted(set(update.episodes) | set(numbers))
