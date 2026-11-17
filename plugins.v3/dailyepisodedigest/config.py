@@ -54,6 +54,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "image_only": True,
     # 剧名后显示「当前集数/订阅总集数」进度徽标
     "show_episode_progress": True,
+    # 昨日入库汇总卡（部数/集数/电影 + 片名速览）
+    "show_yesterday_summary": True,
+    # 明日更新区块，数据来自 MoviePilot 订阅日历
+    "show_tomorrow_updates": True,
 }
 
 _TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -125,6 +129,12 @@ def normalize_config(config: Optional[Mapping[str, Any]]) -> dict[str, Any]:
     result["image_only"] = _as_bool(raw.get("image_only"), DEFAULT_CONFIG["image_only"])
     result["show_episode_progress"] = _as_bool(
         raw.get("show_episode_progress"), DEFAULT_CONFIG["show_episode_progress"]
+    )
+    result["show_yesterday_summary"] = _as_bool(
+        raw.get("show_yesterday_summary"), DEFAULT_CONFIG["show_yesterday_summary"]
+    )
+    result["show_tomorrow_updates"] = _as_bool(
+        raw.get("show_tomorrow_updates"), DEFAULT_CONFIG["show_tomorrow_updates"]
     )
     return result
 

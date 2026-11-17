@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from apscheduler.triggers.cron import CronTrigger
@@ -28,7 +28,7 @@ from app.sdk.plugin import _PluginBase
 
 from .boxoffice import fetch_boxoffice
 from .card import prune_old_cards, render_card
-from .collector import fetch_records, fetch_subscriptions
+from .collector import fetch_calendar, fetch_records, fetch_subscriptions
 from .config import (
     DEFAULT_CONFIG,
     MEDIA_TYPE_OPTIONS,
@@ -39,7 +39,14 @@ from .config import (
     resolve_window,
     split_words,
 )
-from .digest import Digest, attach_subscription_totals, build_digest, render
+from .digest import (
+    CalendarUpdate,
+    Digest,
+    attach_subscription_totals,
+    build_digest,
+    parse_calendar_updates,
+    render,
+)
 from .fonts import FontBook, locate_font, resolve_font
 
 # 卡片文件名格式，同时用于校验接口入参，杜绝路径穿越
@@ -76,8 +83,8 @@ class DailyEpisodeDigest(_PluginBase):
 
     plugin_name = "每日入库速报"
     plugin_desc = "定时统计每天新入库的剧集与电影，渲染成带封面的日报长图，通过 MoviePilot 通知渠道推送。"
-    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.6.3"
+    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/statistic.png"
+    plugin_version = "2.7.0"
     plugin_label = "媒体库,通知"
     plugin_author = "kongchengll"
     plugin_config_prefix = "dailyepisodedigest_"
@@ -639,6 +646,19 @@ class DailyEpisodeDigest(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
+                            self._col(
+                                6,
+                                [self._switch("show_yesterday_summary", "图片显示昨日入库汇总")],
+                            ),
+                            self._col(
+                                6,
+                                [self._switch("show_tomorrow_updates", "图片显示明日更新")],
+                            ),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             self._col(3, [self._switch("image_only", "仅发送图片")]),
                             self._col(
                                 9,
@@ -677,6 +697,9 @@ class DailyEpisodeDigest(_PluginBase):
                                         "开启「图片追加票房」后，日报末尾会展示猫眼实时票房榜单。"
                                         "开启「剧名后显示集数进度」后，每部剧名后会标注「当前集/订阅总集」，"
                                         "总集数取自 MoviePilot 订阅（手动指定优先），未订阅的剧只显示当前集数。"
+                                        "「昨日入库汇总」在统计卡下方追加本批入库的一句话概要与片名速览。"
+                                        "「明日更新」从 MoviePilot 订阅日历读取明天播出的剧集（海报、剧名、季集、入库进度），"
+                                        "依赖宿主的 API_TOKEN，未配置或读取失败时自动跳过该区块。"
                                         "日报图片以链接形式交给渠道，插件会依次实测「外网访问地址 → 宿主域名 → 容器内地址」，"
                                         "取第一个可访问的；外网地址解析不了时会回退到容器内地址，"
                                         "此时 Telegram、微信能正常收图，钉钉、飞书这类由客户端拉图的渠道会看不到图。"
@@ -896,11 +919,23 @@ class DailyEpisodeDigest(_PluginBase):
             if boxoffice.error:
                 logger.warning(f"每日入库速报：票房数据获取失败，跳过票房区域：{boxoffice.error}")
 
+        # 明日更新：从订阅日历取「明天」播出的剧集
+        upcoming: list[CalendarUpdate] = []
+        if self._config.get("show_tomorrow_updates"):
+            tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+            after = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d")
+            events = fetch_calendar(tomorrow, after)
+            if events is not None:
+                upcoming = parse_calendar_updates(events)
+                logger.debug(f"每日入库速报：明日更新解析出 {len(upcoming)} 部剧集")
+
         if not render_card(
             digest, font_book, target,
             max_rows=int(self._config.get("image_items") or 8),
             boxoffice=boxoffice,
             show_progress=bool(self._config.get("show_episode_progress")),
+            show_summary=bool(self._config.get("show_yesterday_summary")),
+            upcoming=upcoming,
         ):
             logger.warning("每日入库速报：日报图片生成失败，本次降级为纯文本推送")
             return None, None

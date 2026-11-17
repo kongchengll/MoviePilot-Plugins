@@ -19,7 +19,7 @@ from typing import Any, Optional
 from app.sdk.logging import logger
 
 from .boxoffice import BoxOfficeData
-from .digest import Digest, EpisodeGroup, episode_progress, format_episodes, short_time
+from .digest import CalendarUpdate, Digest, EpisodeGroup, episode_progress, format_episodes, short_time
 from .fonts import FontBook
 
 # 画布宽度固定为 1080，主流渠道展示时不会被压缩到看不清文字
@@ -38,6 +38,14 @@ _PANEL_RADIUS = 22
 # 统计卡片
 _STAT_HEIGHT = 112
 _STAT_GAP = 16
+# 昨日汇总面板
+_SUMMARY_HEIGHT = 150
+# 明日更新区块
+_UPCOMING_TITLE_HEIGHT = 42
+_UPCOMING_CARD_HEIGHT = 96
+_UPCOMING_GAP = 14
+_UPCOMING_POSTER_W = 56
+_UPCOMING_POSTER_H = 84
 # 票房面板
 _BOX_SIDE_PAD = 28
 _BOX_TITLE_HEIGHT = 46
@@ -331,6 +339,8 @@ def _layout(
     rows: list[EpisodeGroup],
     hidden: int,
     boxoffice: Optional[BoxOfficeData],
+    show_summary: bool = False,
+    upcoming: Optional[list[CalendarUpdate]] = None,
 ) -> tuple[list[tuple[str, int, int]], int]:
     """
     先计算各区块位置与画布总高度，再交给绘制函数按位置渲染。
@@ -347,14 +357,25 @@ def _layout(
 
     rows_height = len(rows) * _ROW_HEIGHT + max(0, len(rows) - 1) * _ROW_GAP
     box_height = _boxoffice_height(boxoffice)
+    upcoming = upcoming or []
+    upcoming_height = (
+        _UPCOMING_TITLE_HEIGHT
+        + len(upcoming) * _UPCOMING_CARD_HEIGHT
+        + max(0, len(upcoming) - 1) * _UPCOMING_GAP
+        + 24
+    ) if upcoming else 0
 
     add("topbar", 8)
     add("header", 150, 18)
     add("stats", _STAT_HEIGHT, 30)
+    if show_summary:
+        add("summary", _SUMMARY_HEIGHT, 24)
     add("listhead", 40, 16)
     add("rows", rows_height, 22)
     if hidden:
         add("hidden", 40, 10)
+    if upcoming_height:
+        add("upcoming", upcoming_height, 20)
     if box_height:
         add("boxoffice", box_height, 24)
     add("footer", 92, 18)
@@ -401,6 +422,162 @@ def _draw_stats(draw: Any, digest: Digest, top: int, font_book: FontBook) -> Non
         value_width = draw.textlength(value, font=font_value)
         draw.text((left + 42 + value_width + 10, top + 48), unit, font=font_unit, fill=color, anchor="lm")
         draw.text((left + 20, top + 88), label, font=font_label, fill=_MUTED, anchor="lm")
+
+
+def _draw_summary(draw: Any, digest: Digest, top: int, font_book: FontBook) -> None:
+    """
+    昨日入库汇总：左侧一句话概要，右侧本批片名速览胶囊。
+    """
+    _panel(draw, (_PAD, top, _WIDTH - _PAD, top + _SUMMARY_HEIGHT), fill=_PANEL_ALT)
+    draw.rounded_rectangle((_PAD + 24, top + 24, _PAD + 30, top + 56), radius=3, fill=_ORANGE)
+    _bold(draw, (_PAD + 44, top + 40), "昨日入库汇总", font_book.get(28), _TEXT)
+
+    shows = digest.total_shows - digest.total_movies
+    parts = [f"{shows} 部剧集"] if shows else []
+    if digest.total_episodes:
+        parts.append(f"{digest.total_episodes} 集")
+    if digest.total_movies:
+        parts.append(f"{digest.total_movies} 部电影")
+    headline = " · ".join(parts) if parts else "无新增入库"
+    draw.text((_PAD + 44, top + 84), headline, font=font_book.get(24), fill=_ORANGE, anchor="lm")
+
+    # 片名速览：最多 6 部，超出用 +N 汇总
+    names = [group.title for group in digest.groups[:6]]
+    if digest.dropped or len(digest.groups) > 6:
+        names.append(f"+{(digest.total_shows - len(digest.groups)) + digest.dropped + max(0, len(digest.groups) - 6)}")
+    font_chip = font_book.get(20)
+    chip_x = _PAD + 44
+    chip_y = top + 104
+    for name in names:
+        chip_w = int(draw.textlength(name, font=font_chip)) + 22
+        if chip_x + chip_w > _WIDTH - _PAD - 24:
+            break
+        draw.rounded_rectangle(
+            (chip_x, chip_y, chip_x + chip_w, chip_y + 30), radius=15,
+            fill=_tint(_ACCENT, 0.18),
+        )
+        draw.text((chip_x + chip_w / 2, chip_y + 16), name, font=font_chip, fill=_ACCENT, anchor="mm")
+        chip_x += chip_w + 10
+
+
+def _upcoming_height(upcoming: list[CalendarUpdate]) -> int:
+    """
+    计算明日更新区块高度，空列表返回 0。
+    """
+    if not upcoming:
+        return 0
+    return (
+        _UPCOMING_TITLE_HEIGHT
+        + len(upcoming) * _UPCOMING_CARD_HEIGHT
+        + max(0, len(upcoming) - 1) * _UPCOMING_GAP
+        + 24
+    )
+
+
+def _paste_small_poster(canvas: Any, url: str, title: str, left: int, top: int, font_book: FontBook) -> None:
+    """
+    明日更新卡片的小海报：等比裁剪到固定尺寸，失败用首字占位。
+    """
+    from PIL import Image, ImageDraw
+
+    poster = _fetch_poster(url) if url else None
+    if poster is None:
+        seed = sum(ord(char) for char in title) or 1
+        base = (44 + seed % 40, 52 + (seed // 7) % 40, 72 + (seed // 13) % 46)
+        poster = Image.new("RGB", (_UPCOMING_POSTER_W * 3, _UPCOMING_POSTER_H * 3), base)
+    try:
+        source_w, source_h = poster.size
+        scale = max(_UPCOMING_POSTER_W / source_w, _UPCOMING_POSTER_H / source_h)
+        resized = poster.resize(
+            (max(1, round(source_w * scale)), max(1, round(source_h * scale))),
+            Image.Resampling.LANCZOS,
+        )
+        crop_left = max(0, (resized.size[0] - _UPCOMING_POSTER_W) // 2)
+        crop_top = max(0, (resized.size[1] - _UPCOMING_POSTER_H) // 2)
+        cropped = resized.crop((
+            crop_left, crop_top,
+            crop_left + _UPCOMING_POSTER_W, crop_top + _UPCOMING_POSTER_H,
+        ))
+        mask = Image.new("L", (_UPCOMING_POSTER_W, _UPCOMING_POSTER_H), 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            (0, 0, _UPCOMING_POSTER_W - 1, _UPCOMING_POSTER_H - 1), radius=9, fill=255,
+        )
+        canvas.paste(cropped, (left, top), mask)
+        cropped.close()
+        resized.close()
+    finally:
+        poster.close()
+
+
+def _draw_upcoming(
+    draw: Any,
+    canvas: Any,
+    upcoming: list[CalendarUpdate],
+    top: int,
+    height: int,
+    font_book: FontBook,
+) -> None:
+    """
+    明日更新：小标题 + 每部一张横向卡片（小海报、剧名、季集、本集标题、入库进度）。
+    """
+    draw.rounded_rectangle((_PAD, top + 10, _PAD + 6, top + 36), radius=3, fill=_PURPLE)
+    _bold(draw, (_PAD + 22, top + 23), "明日更新", font_book.get(30), _TEXT)
+    draw.text(
+        (_WIDTH - _PAD, top + 23),
+        "来自订阅日历  ·  按播出日期",
+        font=font_book.get(20), fill=_DIM, anchor="rm",
+    )
+
+    inner_left = _PAD + 14
+    inner_right = _WIDTH - _PAD - 14
+    y = top + _UPCOMING_TITLE_HEIGHT
+    font_name = font_book.get(26)
+    font_meta = font_book.get(21)
+    font_progress = font_book.get(20)
+    for update in upcoming:
+        _panel(draw, (inner_left, y, inner_right, y + _UPCOMING_CARD_HEIGHT), fill=_PANEL, radius=16)
+        poster_x, poster_y = inner_left + 8, y + (_UPCOMING_CARD_HEIGHT - _UPCOMING_POSTER_H) // 2
+        _paste_small_poster(canvas, update.poster or "", update.title, poster_x, poster_y, font_book)
+        draw.rounded_rectangle(
+            (poster_x, poster_y, poster_x + _UPCOMING_POSTER_W - 1, poster_y + _UPCOMING_POSTER_H - 1),
+            radius=9, outline=_BORDER, width=1,
+        )
+
+        text_x = poster_x + _UPCOMING_POSTER_W + 18
+        text_right = inner_right - 16
+        text_width = text_right - text_x
+        _bold(
+            draw, (text_x, y + 26),
+            _ellipsize(draw, update.title, font_name, text_width),
+            font_name, _TEXT,
+        )
+
+        ep_label = format_episodes(update.episodes)
+        label = f"{update.season} {ep_label}" if update.season and ep_label else (ep_label or "待定")
+        draw.text((text_x, y + 56), _ellipsize(draw, label, font_meta, text_width), font=font_meta, fill=_CYAN, anchor="lm")
+
+        # 本集标题（若有）
+        if update.episode_names:
+            name_line = " / ".join(update.episode_names[:2])
+            draw.text(
+                (text_x, y + 80),
+                _ellipsize(draw, name_line, font_meta, text_width - 140),
+                font=font_meta, fill=_MUTED, anchor="lm",
+            )
+        # 已入库进度徽标
+        if update.progress:
+            badge = f"已入库 {update.progress}"
+            badge_w = int(draw.textlength(badge, font=font_progress)) + 20
+            bx = text_right - badge_w
+            draw.rounded_rectangle(
+                (bx, y + 70, text_right, y + 98), radius=14,
+                fill=_tint(_PURPLE, 0.22),
+            )
+            draw.text(
+                (bx + badge_w / 2, y + 84), badge,
+                font=font_progress, fill=_PURPLE, anchor="mm",
+            )
+        y += _UPCOMING_CARD_HEIGHT + _UPCOMING_GAP
 
 
 def _draw_listhead(draw: Any, digest: Digest, top: int, font_book: FontBook) -> None:
@@ -632,6 +809,8 @@ def render_card(
     max_rows: int = _MAX_ROWS,
     boxoffice: Optional[BoxOfficeData] = None,
     show_progress: bool = True,
+    show_summary: bool = False,
+    upcoming: Optional[list[CalendarUpdate]] = None,
 ) -> Optional[Path]:
     """
     绘制日报卡片并保存为 JPEG。
@@ -642,6 +821,8 @@ def render_card(
     :param max_rows: 卡片内最多列出几部，超出部分在底部汇总提示
     :param boxoffice: 可选的猫眼实时票房数据
     :param show_progress: 是否在剧名后显示集数进度徽标
+    :param show_summary: 是否显示昨日入库汇总区块
+    :param upcoming: 明日更新的订阅日历事件列表
     :return: 成功时返回输出路径，否则返回 None
     """
     try:
@@ -660,7 +841,8 @@ def render_card(
 
     rows = list(digest.groups[:max_rows])
     hidden = (digest.total_shows - len(rows)) + digest.dropped
-    sections, height = _layout(rows, hidden, boxoffice)
+    upcoming = list(upcoming or [])
+    sections, height = _layout(rows, hidden, boxoffice, show_summary, upcoming)
 
     canvas = Image.new("RGB", (_WIDTH, height), _BG_TOP)
     _draw_gradient(canvas, height)
@@ -673,6 +855,8 @@ def render_card(
             _draw_header(draw, digest, top, font_book)
         elif name == "stats":
             _draw_stats(draw, digest, top, font_book)
+        elif name == "summary":
+            _draw_summary(draw, digest, top, font_book)
         elif name == "listhead":
             _draw_listhead(draw, digest, top, font_book)
         elif name == "rows":
@@ -684,6 +868,8 @@ def render_card(
                 )
         elif name == "hidden":
             _draw_hidden(draw, hidden, top, font_book)
+        elif name == "upcoming":
+            _draw_upcoming(draw, canvas, upcoming, top, section_height, font_book)
         elif name == "boxoffice" and boxoffice:
             _draw_boxoffice(draw, boxoffice, top, section_height, font_book)
         elif name == "footer":

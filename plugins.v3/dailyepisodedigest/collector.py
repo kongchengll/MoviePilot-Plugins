@@ -7,9 +7,12 @@
 from __future__ import annotations
 
 from typing import Any, Iterable
+from urllib.parse import urlencode
 
 from app.schemas.types import MediaType
+from app.sdk.config import settings
 from app.sdk.logging import logger
+from app.sdk.network import RequestUtils
 from app.sdk.queries import (
     QueryPageRequest,
     QuerySort,
@@ -150,3 +153,48 @@ def fetch_subscriptions() -> list[dict[str, Any]]:
     except Exception as error:  # noqa: BLE001 - 订阅查询失败不应中断日报
         logger.warning(f"每日入库速报：读取订阅失败，本次不显示总集数：{error}")
         return []
+
+
+def fetch_calendar(start_date: str, end_date: str) -> Optional[list[Any]]:
+    """
+    从宿主订阅日历接口读取指定日期窗口的播出事件（左闭右开，日期格式 YYYY-MM-DD）。
+
+    走容器内 HTTP 自调用并使用宿主 API_TOKEN 认证，避免插件依赖宿主的异步链与非稳定 SDK。
+    查询失败返回 None，让调用方区分「无更新」与「取数失败」。
+
+    :param start_date: 起始日期（含），如 `2026-11-18`
+    :param end_date: 结束日期（不含），如 `2026-11-19`
+    :return: 日历条目列表；失败返回 None
+    """
+    token = str(getattr(settings, "API_TOKEN", "") or "").strip()
+    if not token:
+        logger.debug("每日入库速报：宿主未配置 API_TOKEN，跳过订阅日历读取")
+        return None
+    try:
+        port = int(getattr(settings, "PORT", 3001) or 3001)
+    except (TypeError, ValueError):
+        port = 3001
+
+    params = urlencode(
+        {"start": start_date, "end": end_date, "page": 1, "count": 200, "token": token}
+    )
+    url = f"http://127.0.0.1:{port}/api/v1/subscribe/calendar?{params}"
+    try:
+        response = RequestUtils(timeout=15).get_res(url)
+        if response is None or getattr(response, "status_code", 0) != 200:
+            logger.warning(
+                f"每日入库速报：订阅日历请求失败 "
+                f"HTTP {getattr(response, 'status_code', '无响应')}"
+            )
+            return None
+        payload = response.json()
+        if isinstance(payload, dict) and payload.get("success") is False:
+            logger.warning(f"每日入库速报：订阅日历返回失败：{payload.get('message')}")
+            return None
+        data = payload.get("data", payload) if isinstance(payload, dict) else {}
+        items = data.get("items", []) if isinstance(data, dict) else []
+        logger.debug(f"每日入库速报：订阅日历 {start_date}~{end_date} 命中 {len(items)} 条")
+        return list(items or [])
+    except Exception as error:  # noqa: BLE001 - 日历失败不影响主日报
+        logger.warning(f"每日入库速报：读取订阅日历失败，跳过明日更新区块：{error}")
+        return None

@@ -24,6 +24,7 @@ from app.plugins.dailyepisodedigest.digest import (
     build_digest,
     episode_progress,
     format_episodes,
+    parse_calendar_updates,
     parse_episodes,
     render,
 )
@@ -349,3 +350,73 @@ def test_render_shows_progress_when_matched():
     attach_subscription_totals(digest, [{"name": "漫长的季节", "season": 1, "total_episode": 32}])
     _, text = render(digest)
     assert "1. 漫长的季节  [14/32]" in text
+
+
+def _calendar_payload():
+    """
+    模拟宿主订阅日历响应：一部剧两条分集 + 一条电影 + 一条无集号。
+    """
+    def event(name, mtype, numbers, season=1, completed=12, total=24, poster=""):
+        return {
+            "date": "2026-11-18",
+            "episodes": [{"episode_number": number, "name": f"第{number}集"} for number in numbers],
+            "subscribe": {
+                "name": name, "type": mtype, "season": season,
+                "completed_episode": completed, "total_episode": total, "poster": poster,
+            },
+        }
+    return {
+        "success": True,
+        "data": {
+            "items": [
+                event("某剧" , "电视剧", [13, 14]),
+                event("某剧" , "电视剧", [15]),
+                event("某电影", "电影", []),
+                event("空集剧", "电视剧", []),
+            ],
+            "total": 4,
+        },
+    }
+
+
+def test_parse_calendar_updates_merges_and_filters():
+    """
+    日历解析应合并同剧分集、过滤电影与无集号条目，并生成进度文本。
+    """
+    updates = parse_calendar_updates(_calendar_payload())
+    assert len(updates) == 1
+    update = updates[0]
+    assert update.title == "某剧"
+    assert update.season == "S01"
+    assert update.episodes == [13, 14, 15]
+    assert update.progress == "12/24"
+    assert update.episode_names == ["第13集", "第14集", "第15集"]
+
+
+def test_parse_calendar_updates_accepts_plain_list_and_progress_variants():
+    """
+    直接列表输入也应支持；无总集数时进度只显示已入库集数。
+    """
+    items = [{
+        "date": "2026-11-18",
+        "episodes": [{"episode_number": 8}],
+        "subscribe": {"name": "另一部剧", "type": "电视剧", "season": 2, "completed_episode": 8, "total_episode": 0},
+    }]
+    updates = parse_calendar_updates(items)
+    assert len(updates) == 1
+    assert updates[0].season == "S02"
+    assert updates[0].progress == "8"
+    assert parse_calendar_updates({}) == []
+    assert parse_calendar_updates(None) == []
+
+
+def test_normalize_config_new_switches():
+    """
+    昨日汇总与明日更新开关默认开启，可显式关闭。
+    """
+    config = normalize_config(None)
+    assert config["show_yesterday_summary"] is True
+    assert config["show_tomorrow_updates"] is True
+    config = normalize_config({"show_yesterday_summary": False, "show_tomorrow_updates": "false"})
+    assert config["show_yesterday_summary"] is False
+    assert config["show_tomorrow_updates"] is False

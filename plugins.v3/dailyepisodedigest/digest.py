@@ -83,6 +83,32 @@ class EpisodeGroup:
 
 
 @dataclass
+class CalendarUpdate:
+    """
+    订阅日历里某部剧在目标日期的播出事件（用于「明日更新」区块）。
+    """
+
+    title: str
+    season: Optional[str] = None
+    episodes: list[int] = field(default_factory=list)
+    episode_names: list[str] = field(default_factory=list)
+    poster: Optional[str] = None
+    completed: Optional[int] = None
+    total: Optional[int] = None
+
+    @property
+    def progress(self) -> str:
+        """
+        已入库进度文本，如 `12/24`；无总集数时只显示已入库集数。
+        """
+        if self.completed is None:
+            return ""
+        if self.total and self.total > 0:
+            return f"{self.completed}/{self.total}"
+        return str(self.completed)
+
+
+@dataclass
 class Digest:
     """
     一次推送所需的完整数据，渲染层只读取这里，不再访问宿主。
@@ -371,6 +397,91 @@ def episode_progress(group: EpisodeGroup) -> str:
     if group.total_episodes and group.total_episodes > 0:
         return f"{current}/{group.total_episodes}"
     return str(current)
+
+
+def parse_calendar_updates(payload: Any) -> list[CalendarUpdate]:
+    """
+    把宿主订阅日历响应解析成按剧合并的播出事件列表。
+
+    接受完整响应 `{"data": {"items": [...]}}`、分页对象 `{"items": [...]}` 或直接条目列表。
+    同一部剧同一天的多个分集会合并；跳过非电视剧事件与无播出集号的条目。
+
+    :param payload: 宿主 `/api/v1/subscribe/calendar` 的 JSON 响应
+    :return: 按剧名排序的播出事件
+    """
+    if isinstance(payload, dict):
+        data = payload.get("data", payload)
+        items = data.get("items", []) if isinstance(data, dict) else []
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        items = []
+
+    merged: dict[tuple[str, str], CalendarUpdate] = {}
+    for event in items:
+        if not isinstance(event, dict):
+            continue
+        subscribe = event.get("subscribe") or {}
+        if not isinstance(subscribe, dict):
+            continue
+        # 日历同时含电影上映，本区块只展示剧集更新
+        media_type = str(subscribe.get("type") or "")
+        if media_type and media_type != _TV_TYPE:
+            continue
+        title = str(subscribe.get("name") or "").strip()
+        if not title:
+            continue
+        episodes = event.get("episodes") or []
+        numbers: list[int] = []
+        names: list[str] = []
+        for episode in episodes:
+            if not isinstance(episode, dict):
+                continue
+            try:
+                number = int(episode.get("episode_number") or 0)
+            except (TypeError, ValueError):
+                number = 0
+            if number > 0:
+                numbers.append(number)
+            name = str(episode.get("name") or "").strip()
+            if name:
+                names.append(name)
+        if not numbers:
+            continue
+
+        raw_season = str(subscribe.get("season") or "")
+        season = f"S{int(raw_season):02d}" if raw_season.isdigit() else None
+        completed = _as_positive_int(subscribe.get("completed_episode"))
+        total = _as_positive_int(subscribe.get("total_episode"))
+
+        key = (title, season or "")
+        update = merged.get(key)
+        if update is None:
+            update = CalendarUpdate(
+                title=title,
+                season=season,
+                poster=str(subscribe.get("poster") or "").strip() or None,
+                completed=completed,
+                total=total,
+            )
+            merged[key] = update
+        update.episodes = sorted(set(update.episodes) | set(numbers))
+        for name in names:
+            if name not in update.episode_names:
+                update.episode_names.append(name)
+
+    return sorted(merged.values(), key=lambda item: (item.title, item.season or ""))
+
+
+def _as_positive_int(value: Any) -> Optional[int]:
+    """
+    把可能是字符串/None 的集数字段归一为正整数，失败返回 None。
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def group_detail(group: EpisodeGroup) -> str:
